@@ -11,8 +11,8 @@ use crate::dataset::Dataset;
 use super::super::{
     FixedIvfTrainingRanges, FixedIvfTrainingSampler, KMeansProgressCallback,
     StreamingFloatKMeansMetricPolicy, StreamingKMeansMetricPolicy, WeightedCoreset,
-    WeightedHierarchicalKMeansParams, append_local_coreset, f32_fsl_from_values,
-    cast_training_data_to_f32, refine_streaming_f32_kmeans_with_resampling,
+    WeightedHierarchicalKMeansParams, append_local_coreset, cast_training_data_to_f32,
+    f32_fsl_from_values, refine_streaming_f32_kmeans_with_resampling,
     refine_streaming_f32_kmeans_with_sampler, refine_weighted_f32_kmeans,
     train_weighted_hierarchical_f32_kmeans,
 };
