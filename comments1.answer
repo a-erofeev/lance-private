@@ -1,0 +1,4 @@
+all_buffers.total() includes buffers for every payload column, including nested/list child buffers. A 1024-dimensional float32 payload contributes roughly 4 KiB per row, so the 256 MiB threshold should select the external path after
+  roughly 65K rows, well before the one-million-row limit. HashJoiner stores only the encoded join key and (batch_index, row_index) in its DashMap; it does not copy the wide payload into the map.
+
+I propose to increase memory threshold in this MR (to 512Mb for example), and make the threshold configurable later.

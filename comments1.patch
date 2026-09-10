@@ -1,0 +1,134 @@
+diff --git a/rust/lance/src/dataset/update_join.rs b/rust/lance/src/dataset/update_join.rs
+index f4b5f1e7c..c77ff0a91 100644
+--- a/rust/lance/src/dataset/update_join.rs
++++ b/rust/lance/src/dataset/update_join.rs
+@@ -51,6 +51,11 @@ const DEFAULT_MAX_HASH_BYTES: usize = 256 * 1024 * 1024;
+ const MAX_SORT_MERGE_RESERVATION: usize = 10 * 1024 * 1024;
+ /// Upper bound for a batch entering an external sort.
+ const MAX_INPUT_BATCH_BYTES: usize = 25 * 1024 * 1024;
++/// Number of partitions used by the current external update plan.
++///
++/// TODO: Parallelize the key sorts and sort-merge join, then merge their output into the
++/// single globally row-address-ordered patch stream required by [`SortedPatchCursor`].
++const EXTERNAL_UPDATE_PARTITIONS: usize = 1;
+ 
+ #[derive(Clone)]
+ pub(super) struct UpdateColumnsOptions {
+@@ -66,7 +71,7 @@ impl Default for UpdateColumnsOptions {
+         Self {
+             execution_options: LanceExecutionOptions {
+                 use_spilling: true,
+-                target_partition: Some(1),
++                target_partition: Some(EXTERNAL_UPDATE_PARTITIONS),
+                 batch_size: Some(EXECUTION_BATCH_SIZE),
+                 ..Default::default()
+             },
+@@ -79,6 +84,7 @@ impl Default for UpdateColumnsOptions {
+ }
+ 
+ enum PreparedRhs {
++    Empty,
+     InMemory(Vec<RecordBatch>),
+     External(SendableRecordBatchStream),
+ }
+@@ -144,6 +150,9 @@ async fn prepare_rhs(
+ 
+     while let Some(batch) = unread.next().await {
+         let batch = batch?;
++        if batch.num_rows() == 0 {
++            continue;
++        }
+         all_buffers.record_batch(&batch);
+         key_buffers.record_array(batch.column(key_index).as_ref());
+         let next_row_count = row_count.checked_add(batch.num_rows());
+@@ -182,6 +191,11 @@ async fn prepare_rhs(
+         }
+     }
+ 
++    if row_count == 0 {
++        tracing::debug!(strategy = "empty", "selected update-columns join strategy");
++        return Ok(PreparedRhs::Empty);
++    }
++
+     let estimated_bytes = key_buffers
+         .total()
+         .checked_mul(2)
+@@ -258,6 +272,11 @@ pub(super) async fn update_columns_with_options(
+     validate_key_types(fragment, left_on, &right_schema, right_on)?;
+ 
+     match prepare_rhs(right_reader, right_on, &options).await? {
++        PreparedRhs::Empty => Ok(FragmentUpdateColumnsResult {
++            fragment: fragment.metadata.clone(),
++            fields_modified: Vec::new(),
++            matched_offsets: RoaringBitmap::new(),
++        }),
+         PreparedRhs::InMemory(batches) => {
+             run_hash_update(
+                 fragment,
+@@ -393,7 +412,7 @@ async fn run_external_update(
+     session_context: Option<SessionContext>,
+ ) -> Result<FragmentUpdateColumnsResult> {
+     execution_options.batch_size = Some(EXECUTION_BATCH_SIZE);
+-    execution_options.target_partition = Some(1);
++    execution_options.target_partition = Some(EXTERNAL_UPDATE_PARTITIONS);
+     let pool_size = usize::try_from(execution_options.mem_pool_size()).unwrap_or(usize::MAX);
+     let sort_merge_reservation = MAX_SORT_MERGE_RESERVATION.min(pool_size / 8).max(1);
+     let input_batch_cap = MAX_INPUT_BATCH_BYTES.min(pool_size / 8).max(1);
+@@ -994,7 +1013,7 @@ mod tests {
+         let prepared = prepare_rhs(reader(schema.clone(), vec![]), "key", &options(1, 1))
+             .await
+             .unwrap();
+-        assert!(matches!(prepared, PreparedRhs::InMemory(batches) if batches.is_empty()));
++        assert!(matches!(prepared, PreparedRhs::Empty));
+ 
+         let empty = RecordBatch::new_empty(schema.clone());
+         let prepared = prepare_rhs(
+@@ -1004,9 +1023,45 @@ mod tests {
+         )
+         .await
+         .unwrap();
+-        assert!(
+-            matches!(prepared, PreparedRhs::InMemory(batches) if batches.len() == 1 && batches[0].num_rows() == 0)
+-        );
++        assert!(matches!(prepared, PreparedRhs::Empty));
++    }
++
++    #[rstest]
++    #[case::no_batches(false)]
++    #[case::zero_row_batches(true)]
++    #[tokio::test]
++    async fn test_empty_rhs_is_noop(#[case] include_zero_row_batches: bool) {
++        let test_dir = TempStrDir::default();
++        let input = record_batch!(("key", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
++        let dataset = Dataset::write(
++            RecordBatchIterator::new(vec![Ok(input.clone())], input.schema()),
++            test_dir.as_ref(),
++            None,
++        )
++        .await
++        .unwrap();
++        let update_schema = input.schema();
++        let update_batches = if include_zero_row_batches {
++            vec![Ok(RecordBatch::new_empty(update_schema.clone()))]
++        } else {
++            Vec::new()
++        };
++        let mut fragment = dataset.get_fragment(0).unwrap();
++        let original_fragment = fragment.metadata().clone();
++
++        let result = update_columns_with_options(
++            &mut fragment,
++            reader(update_schema, update_batches),
++            "key",
++            "key",
++            UpdateColumnsOptions::default(),
++        )
++        .await
++        .unwrap();
++
++        assert_eq!(result.fragment, original_fragment);
++        assert!(result.fields_modified.is_empty());
++        assert!(result.matched_offsets.is_empty());
+     }
+ 
+     #[tokio::test]
