@@ -91,6 +91,7 @@ pub mod statistics;
 mod take;
 pub mod transaction;
 pub mod udtf;
+mod update_join;
 pub mod updater;
 mod utils;
 pub mod write;
