@@ -1,0 +1,17 @@
+
+P2-1: Lite scheduler fail-fast does not cancel in-flight native I/O
+
+scheduler.rs:1255-1263 — The lite scheduler fail-fast path drops TaskHandle futures on early error return. Drop for TaskHandle calls abandon() (lite.rs:707), which releases the backpressure reservation but does not call cancel() on the running task. The native read continues to completion in the background, consuming I/O bandwidth and cache resources for a request whose result will be discarded. The standard scheduler has proper RequestCancellation with tokio::select! in IoTask::run() (scheduler.rs:641); the lite scheduler has no equivalent.
+
+P2-2: validate_read_length is unconditionally applied to all reads
+
+scheduler.rs:563-576 — validate_read_length checks that returned bytes match the requested range length. This is applied unconditionally in IoTask::read(). For object stores that return fewer bytes than requested on truncated reads or range-end conditions, this would turn a successful read into an error. Verify that all object store providers (especially Fabric, which may return partial data on concurrent truncation) always return exactly the requested number of bytes for non-empty ranges.
+
+
+P2-4: validate_read_length only applies to the standard scheduler path, lite scheduler is unprotected
+
+scheduler.rs:633 — IoTask::read() calls validate_read_length() to check returned byte count. However, submit_request_lite (scheduler.rs:1238) uses its own run_fn that calls reader.get_range().map_err() directly without validate_read_length. So truncated reads on the lite scheduler path will still go undetected. This is not a regression (old code had no validation on either path), but the protection is inconsistent across the two scheduler implementations.
+
+P2-5: DataChunk.num_bytes is set to 0 for cancelled (non-admitted) tasks
+
+scheduler.rs:1180 — For cancelled tasks that were never admitted, DataChunk.num_bytes is set to 0 instead of the actual requested range size. This is correct for backpressure accounting (cancelled tasks never consumed bytes), but if any downstream consumer uses DataChunk.num_bytes for metrics reporting or billing rather than backpressure, it will undercount. Verify that all DataChunk consumers handle num_bytes=0 correctly.

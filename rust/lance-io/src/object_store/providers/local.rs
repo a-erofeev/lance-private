@@ -30,6 +30,7 @@ impl ObjectStoreProvider for FileStoreProvider {
             list_is_lexically_ordered: false,
             io_parallelism: DEFAULT_LOCAL_IO_PARALLELISM,
             download_retry_count,
+            scheduler_error_mode: Default::default(),
             io_tracker: Default::default(),
             store_prefix: self
                 .calculate_object_store_prefix(&base_path, params.storage_options())?,

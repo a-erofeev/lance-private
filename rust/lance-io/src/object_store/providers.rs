@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::object_store::WrappingObjectStore;
 use crate::object_store::uri_to_url;
+use crate::scheduler::SchedulerErrorMode;
 
 use super::{ObjectStore, ObjectStoreParams, tracing::ObjectStoreTracingExt};
 use lance_core::error::{Error, LanceOptionExt, Result};
@@ -118,7 +119,8 @@ pub struct ObjectStoreRegistry {
     // Cache of object stores currently in use. We use a weak reference so the
     // cache itself doesn't keep them alive if no object store is actually using
     // it.
-    active_stores: RwLock<HashMap<(String, ObjectStoreParams), Weak<ObjectStore>>>,
+    active_stores:
+        RwLock<HashMap<(String, ObjectStoreParams, SchedulerErrorMode), Weak<ObjectStore>>>,
     // Cache statistics
     hits: AtomicU64,
     misses: AtomicU64,
@@ -205,6 +207,36 @@ impl ObjectStoreRegistry {
         Error::invalid_input(message)
     }
 
+    async fn build_store(
+        &self,
+        provider: Arc<dyn ObjectStoreProvider>,
+        base_path: Url,
+        params: &ObjectStoreParams,
+        store_prefix: &str,
+        scheduler_error_mode: SchedulerErrorMode,
+    ) -> Result<Arc<ObjectStore>> {
+        let mut store = provider.new_store(base_path, params).await?;
+        // Providers construct the physical store, while the registry owns policies
+        // that affect how the shared store is consumed. Applying the validated mode
+        // here covers built-in and out-of-tree providers uniformly.
+        store.set_scheduler_error_mode(scheduler_error_mode);
+
+        store.inner = store.inner.traced();
+
+        // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
+        // `az$container@account`) so multiple stores on one cloud differ.
+        crate::object_store::meter_store(&mut store.inner, &mut store.io_tracker, store_prefix);
+
+        if let Some(wrapper) = &params.object_store_wrapper {
+            store.inner = wrapper.wrap(store_prefix, store.inner);
+        }
+
+        // Always wrap with IO tracking
+        store.inner = store.io_tracker.wrap("", store.inner);
+
+        Ok(Arc::new(store))
+    }
+
     /// Get an object store for a given base path and parameters.
     ///
     /// If the object store is already in use, it will return a strong reference
@@ -221,6 +253,9 @@ impl ObjectStoreRegistry {
         // base contain no scoped entries, so this is a no-op for them.
         let params = params.scoped_to_base(None);
         let params = params.as_ref();
+        // Validate before cache lookup so a cached store cannot hide an invalid
+        // value. The normalized mode also forms part of the cache identity.
+        let scheduler_error_mode = params.scheduler_error_mode()?;
         let scheme = base_path.scheme();
         let Some(provider) = self.get_provider(scheme) else {
             return Err(self.scheme_not_found_error(scheme));
@@ -228,7 +263,7 @@ impl ObjectStoreRegistry {
 
         let cache_path =
             provider.calculate_object_store_prefix(&base_path, params.storage_options())?;
-        let cache_key = (cache_path.clone(), params.clone());
+        let cache_key = (cache_path.clone(), params.clone(), scheduler_error_mode);
 
         // Check if we have a cached store for this base path and params
         {
@@ -261,26 +296,15 @@ impl ObjectStoreRegistry {
 
         self.misses.fetch_add(1, Ordering::Relaxed);
 
-        let mut store = provider.new_store(base_path, params).await?;
-
-        store.inner = store.inner.traced();
-
-        #[cfg(feature = "metrics")]
-        {
-            // Label metrics by the store's unique prefix (e.g. `s3$bucket`,
-            // `az$container@account`) so multiple stores on one cloud differ.
-            use crate::object_store::metrics::ObjectStoreMetricsExt;
-            store.inner = store.inner.metered(cache_path.clone());
-        }
-
-        if let Some(wrapper) = &params.object_store_wrapper {
-            store.inner = wrapper.wrap(&cache_path, store.inner);
-        }
-
-        // Always wrap with IO tracking
-        store.inner = store.io_tracker.wrap("", store.inner);
-
-        let store = Arc::new(store);
+        let store = self
+            .build_store(
+                provider,
+                base_path,
+                params,
+                &cache_path,
+                scheduler_error_mode,
+            )
+            .await?;
 
         {
             // Insert the store into the cache
@@ -384,6 +408,9 @@ mod tests {
 
     use super::*;
 
+    use crate::object_store::{StorageOptionsAccessor, StorageOptionsProvider};
+    use crate::scheduler::SCHEDULER_ERROR_MODE_STORAGE_OPTION;
+
     #[derive(Debug)]
     struct DummyProvider;
 
@@ -395,6 +422,34 @@ mod tests {
             _params: &ObjectStoreParams,
         ) -> Result<ObjectStore> {
             unreachable!("This test doesn't create stores")
+        }
+    }
+
+    #[derive(Debug)]
+    struct StableStorageOptionsProvider;
+
+    #[async_trait::async_trait]
+    impl StorageOptionsProvider for StableStorageOptionsProvider {
+        async fn fetch_storage_options(&self) -> Result<Option<HashMap<String, String>>> {
+            Ok(None)
+        }
+
+        fn provider_id(&self) -> String {
+            "stable-scheduler-mode-provider".to_string()
+        }
+    }
+
+    #[derive(Debug)]
+    struct SchedulerModeIgnoringStoreProvider;
+
+    #[async_trait::async_trait]
+    impl ObjectStoreProvider for SchedulerModeIgnoringStoreProvider {
+        async fn new_store(
+            &self,
+            _base_path: Url,
+            _params: &ObjectStoreParams,
+        ) -> Result<ObjectStore> {
+            Ok(ObjectStore::memory())
         }
     }
 
@@ -410,8 +465,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_store_resolves_base_scoped_options() {
-        use crate::object_store::StorageOptionsAccessor;
-
         let registry = ObjectStoreRegistry::default();
         let url = Url::parse("memory://test").unwrap();
 
@@ -436,6 +489,86 @@ mod tests {
         let store_scoped = registry.get_store(url.clone(), &with_scoped).await.unwrap();
         let store_plain = registry.get_store(url, &without_scoped).await.unwrap();
         assert!(Arc::ptr_eq(&store_scoped, &store_plain));
+    }
+
+    #[tokio::test]
+    async fn test_provider_cache_separates_and_validates_scheduler_error_mode() {
+        let registry = ObjectStoreRegistry::default();
+        let url = Url::parse("memory:///table").unwrap();
+        let storage_options_provider = Arc::new(StableStorageOptionsProvider);
+        let params_for = |value: &str| ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(
+                StorageOptionsAccessor::with_initial_and_provider(
+                    HashMap::from([(
+                        SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                        value.to_string(),
+                    )]),
+                    storage_options_provider.clone(),
+                ),
+            )),
+            ..Default::default()
+        };
+
+        let best_effort = registry
+            .get_store(url.clone(), &params_for("best_effort"))
+            .await
+            .unwrap();
+        let fail_fast = registry
+            .get_store(url.clone(), &params_for("fail_fast"))
+            .await
+            .unwrap();
+        let best_effort_again = registry
+            .get_store(url.clone(), &params_for("best_effort"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            best_effort.scheduler_error_mode(),
+            SchedulerErrorMode::BestEffort
+        );
+        assert_eq!(
+            fail_fast.scheduler_error_mode(),
+            SchedulerErrorMode::FailFast
+        );
+        assert!(!Arc::ptr_eq(&best_effort, &fail_fast));
+        assert!(Arc::ptr_eq(&best_effort, &best_effort_again));
+
+        let error = registry
+            .get_store(url, &params_for("invalid"))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidInput { .. }));
+        assert!(error.to_string().contains(
+            "Invalid scheduler_error_mode value 'invalid'. Valid values are: best_effort, fail_fast"
+        ));
+
+        let stats = registry.stats();
+        assert_eq!((stats.hits, stats.misses, stats.active_stores), (1, 2, 2));
+    }
+
+    #[tokio::test]
+    async fn test_registry_applies_scheduler_error_mode_to_custom_provider_store() {
+        let registry = ObjectStoreRegistry::empty();
+        registry.insert(
+            "custom-memory",
+            Arc::new(SchedulerModeIgnoringStoreProvider),
+        );
+        let params = ObjectStoreParams {
+            storage_options_accessor: Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                HashMap::from([(
+                    SCHEDULER_ERROR_MODE_STORAGE_OPTION.to_string(),
+                    "fail_fast".to_string(),
+                )]),
+            ))),
+            ..Default::default()
+        };
+
+        let store = registry
+            .get_store(Url::parse("custom-memory:///table").unwrap(), &params)
+            .await
+            .unwrap();
+
+        assert_eq!(store.scheduler_error_mode(), SchedulerErrorMode::FailFast);
     }
 
     #[test]
@@ -489,7 +622,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats_hit_miss_tracking() {
-        use crate::object_store::StorageOptionsAccessor;
         let registry = ObjectStoreRegistry::default();
         let url = Url::parse("memory://test").unwrap();
 
