@@ -1,0 +1,13 @@
+Review Issues
+
+P2-1: Empty RHS produces an error instead of a no-op in the InMemory path
+
+update_join.rs:335 — When RHS has zero rows, prepare_rhs returns PreparedRhs::InMemory(vec![]), which is passed to run_hash_update → HashJoiner::try_new → reader.collect() returns an empty Vec → HashJoiner returns "No data" error. An empty RHS should be a no-op update. prepare_rhs has the opportunity to short-circuit this case before it reaches HashJoiner, but does not.
+
+P2-2: target_partition=1 limits sort and join parallelism
+
+update_join.rs:69 and :396 — target_partition is hardcoded to 1. For the bug scenario (hundreds of millions of rows, 4GB+ data), single-partition sort and sort-merge join may be slow. While this is necessary because SortedPatchCursor requires a single ordered patch stream, a TODO or comment would help track future parallelization.
+
+P2-3: Memory estimation formula in prepare_rhs may underestimate wide columns
+
+update_join.rs:155-160 — The estimate is all_buffers.total() + key_buffers.total() * 2 + row_count * 64. The row_count * 64 term approximates per-row hash table metadata, but for wide columns (e.g. 1024-dim float arrays from the bug report), actual DashMap memory overhead (buckets, pointer chains) may exceed this. This could cause the threshold to select the in-memory path when the external path would be more appropriate. The dual limit (1M rows + 256MB) mitigates this, but the byte estimate itself may be optimistic.
