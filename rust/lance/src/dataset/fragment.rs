@@ -23,7 +23,6 @@ use datafusion::logical_expr::Expr;
 use datafusion::scalar::ScalarValue;
 use futures::future::{BoxFuture, try_join_all};
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, join, stream};
-use lance_arrow::json::{convert_json_columns, has_json_fields, is_arrow_json_field};
 use lance_arrow::{RecordBatchExt, SchemaExt};
 use lance_core::datatypes::{
     BlobHandling, NullabilityComparison, OnMissing, OnTypeMismatch, SchemaCompareOptions,
@@ -76,6 +75,7 @@ use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::{
     OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
+use crate::dataset::utils::SchemaAdapter;
 use crate::io::deletion::read_dataset_deletion_file;
 
 /// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
@@ -1528,16 +1528,24 @@ impl FileFragment {
             }
         }
 
-        if let Err(error) = Fragment::try_infer_version(std::slice::from_ref(&self.metadata)) {
-            let first_file = self.metadata.files.first().ok_or_else(|| {
-                Error::internal("mixed file versions reported for an empty fragment")
-            })?;
-            return Err(Error::corrupt_file(
-                self.dataset
-                    .data_file_dir(first_file)?
-                    .join(first_file.path.as_str()),
-                format!("Fragment contains mixed file versions: {error}"),
-            ));
+        let mut saw_v1 = false;
+        let mut saw_v2 = false;
+        for data_file in self.metadata.referenced_lance_files() {
+            match data_file.file_version()? {
+                ConcreteFileVersion::V1 => saw_v1 = true,
+                ConcreteFileVersion::V2_0
+                | ConcreteFileVersion::V2_1
+                | ConcreteFileVersion::V2_2
+                | ConcreteFileVersion::V2_3 => saw_v2 = true,
+            }
+            if saw_v1 && saw_v2 {
+                return Err(Error::corrupt_file(
+                    self.dataset
+                        .data_file_dir(data_file)?
+                        .join(data_file.path.as_str()),
+                    "Fragment mixes V1 and V2 data files",
+                ));
+            }
         }
 
         for data_file in &self.metadata.files {
@@ -2158,17 +2166,10 @@ impl FileFragment {
             None
         };
         // Hash join: rows matched on the right-hand stream rewrite columns; track physical offsets via `_rowaddr`.
-        // Convert Arrow JSON columns (Utf8) to Lance JSON (LargeBinary) in the right stream
-        // so they match the physical storage format read from the fragment's left batch.
-        let right_stream: Box<dyn RecordBatchReader + Send> = if right_schema
-            .fields()
-            .iter()
-            .any(|f| is_arrow_json_field(f) || has_json_fields(f))
-        {
-            Box::new(JsonConvertingReader::new(right_stream))
-        } else {
-            right_stream
-        };
+        // Convert the right stream from its logical form (Arrow JSON, view types)
+        // to the physical form stored on disk so it matches the fragment's left batch.
+        let right_stream =
+            SchemaAdapter::new(right_schema.clone()).to_physical_reader(right_stream);
         let joiner = Arc::new(HashJoiner::try_new(right_stream, right_on).await?);
         let mut matched_offsets = RoaringBitmap::new();
         let frag_id_u32 = u32::try_from(self.metadata.id).map_err(|_| {
@@ -3601,59 +3602,6 @@ impl FragmentReader {
     }
 }
 
-/// A wrapper around a `RecordBatchReader` that converts Arrow JSON columns
-/// (Utf8/LargeUtf8 with `arrow.json` extension) to Lance JSON columns
-/// (LargeBinary with `lance.json` extension / JSONB format).
-///
-/// This is needed when user-provided data contains Arrow JSON fields but the
-/// dataset stores them in Lance's JSONB binary format.
-struct JsonConvertingReader {
-    inner: Box<dyn RecordBatchReader + Send>,
-    schema: arrow_schema::SchemaRef,
-}
-
-impl JsonConvertingReader {
-    fn new(inner: Box<dyn RecordBatchReader + Send>) -> Self {
-        use lance_arrow::json::arrow_json_to_lance_json;
-
-        // Build the converted schema (Arrow JSON fields → Lance JSON fields)
-        let orig_schema = inner.schema();
-        let new_fields: Vec<arrow_schema::FieldRef> = orig_schema
-            .fields()
-            .iter()
-            .map(|f| {
-                if is_arrow_json_field(f) || has_json_fields(f) {
-                    Arc::new(arrow_json_to_lance_json(f))
-                } else {
-                    Arc::clone(f)
-                }
-            })
-            .collect();
-        let schema = Arc::new(arrow_schema::Schema::new_with_metadata(
-            new_fields,
-            orig_schema.metadata().clone(),
-        ));
-
-        Self { inner, schema }
-    }
-}
-
-impl Iterator for JsonConvertingReader {
-    type Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next()
-            .map(|result| result.and_then(|batch| convert_json_columns(&batch)))
-    }
-}
-
-impl RecordBatchReader for JsonConvertingReader {
-    fn schema(&self) -> arrow_schema::SchemaRef {
-        self.schema.clone()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use arrow_arith::numeric::mul;
@@ -3675,8 +3623,8 @@ mod tests {
     use super::*;
     use crate::{
         dataset::{
-            InsertBuilder,
-            transaction::{Operation, UpdateMode, UpdatedFragmentOffsets},
+            CommitBuilder, InsertBuilder,
+            transaction::{Operation, Transaction, UpdateMode, UpdatedFragmentOffsets},
         },
         session::Session,
         utils::test::TestDatasetGenerator,
@@ -6843,8 +6791,17 @@ mod tests {
         Ok(())
     }
 
+    #[rstest]
     #[tokio::test]
-    async fn create_from_file_v2() {
+    async fn create_from_file_v2(
+        #[values(
+            LanceFileVersion::V2_0,
+            LanceFileVersion::V2_1,
+            LanceFileVersion::V2_2,
+            LanceFileVersion::V2_3
+        )]
+        file_version: LanceFileVersion,
+    ) {
         let test_dir = TempStrDir::default();
         let test_uri = &test_dir;
 
@@ -6864,7 +6821,7 @@ mod tests {
         let file_path = dataset.data_dir().join("some_file.lance");
         let object_writer = store.create(&file_path).await.unwrap();
         let mut file_writer = lance_file::versions::create_lazy_writer(
-            LanceFileVersion::Stable.resolve(),
+            file_version.resolve(),
             object_writer,
             FileWriterOptions::default(),
         )
@@ -6880,40 +6837,18 @@ mod tests {
             Fragment::try_infer_version(std::slice::from_ref(&frag))
                 .unwrap()
                 .unwrap(),
-            LanceFileVersion::Stable.resolve()
+            file_version.resolve()
         );
-
-        let mismatched_path = dataset.data_dir().join("mismatched_file.lance");
-        let object_writer = store.create(&mismatched_path).await.unwrap();
-        let mut mismatched_writer = lance_file::versions::create_lazy_writer(
-            lance_file::version::ConcreteFileVersion::V2_0,
-            object_writer,
-            FileWriterOptions::default(),
-        )
-        .unwrap();
-        mismatched_writer.write_batch(&new_data).await.unwrap();
-        mismatched_writer.finish().await.unwrap();
-
-        let err = FileFragment::create_from_file("mismatched_file.lance", &dataset, 1, Some(128))
-            .await
-            .unwrap_err();
-        assert!(matches!(err, Error::InvalidInput { .. }));
-        assert!(err.to_string().contains("File version mismatch"));
 
         let op = Operation::Append {
             fragments: vec![frag],
         };
-        let dataset = Dataset::commit(
-            &dataset.uri,
-            op,
-            Some(dataset.version().version),
-            None,
-            None,
-            Default::default(),
-            false,
-        )
-        .await
-        .unwrap();
+        let transaction = Transaction::new_from_version(dataset.version().version, op);
+        let dataset = CommitBuilder::new(Arc::new(dataset))
+            .with_storage_format(file_version)
+            .execute(transaction)
+            .await
+            .unwrap();
 
         assert_eq!(
             dataset
@@ -7140,13 +7075,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_columns_with_json_extension_type() {
-        use arrow_array::UInt64Array;
+        use arrow_array::{StringViewArray, UInt64Array};
         use lance_arrow::ARROW_EXT_NAME_KEY;
         use lance_arrow::json::ARROW_JSON_EXT_NAME;
         use lance_core::ROW_ID;
         use std::collections::HashMap;
 
-        // Create a dataset with an Arrow JSON extension column
+        // Create a dataset with an Arrow JSON extension column and a Utf8View
+        // column. Both are logical types that Lance stores in a different
+        // physical form (JSONB LargeBinary / Utf8), so the update path must
+        // convert the right-hand stream to match.
         let test_dir = TempStrDir::default();
         let mut json_metadata = HashMap::new();
         json_metadata.insert(
@@ -7157,6 +7095,7 @@ mod tests {
             ArrowField::new("id", DataType::Int64, false),
             ArrowField::new("name", DataType::Utf8, true),
             ArrowField::new("meta", DataType::Utf8, true).with_metadata(json_metadata.clone()),
+            ArrowField::new("desc", DataType::Utf8View, true),
         ]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -7170,6 +7109,7 @@ mod tests {
                     r#"{"x":4}"#,
                     r#"{"x":5}"#,
                 ])),
+                Arc::new(StringViewArray::from(vec!["d1", "d2", "d3", "d4", "d5"])),
             ],
         )
         .unwrap();
@@ -7178,11 +7118,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Build the right stream with Arrow JSON column (Utf8 + arrow.json extension)
-        // Only update rows with row_id 1 and 3
+        // Build the right stream with an Arrow JSON column (Utf8 + arrow.json
+        // extension) and a Utf8View column. Only update rows with row_id 1 and 3.
         let update_schema = Arc::new(ArrowSchema::new(vec![
             ArrowField::new(ROW_ID, DataType::UInt64, false),
             ArrowField::new("meta", DataType::Utf8, true).with_metadata(json_metadata),
+            ArrowField::new("desc", DataType::Utf8View, true),
         ]));
         let update_batch = RecordBatch::try_new(
             update_schema.clone(),
@@ -7192,6 +7133,7 @@ mod tests {
                     r#"{"updated":true,"id":2}"#,
                     r#"{"updated":true,"id":4}"#,
                 ])),
+                Arc::new(StringViewArray::from(vec!["d2-new", "d4-new"])),
             ],
         )
         .unwrap();
@@ -7200,9 +7142,10 @@ mod tests {
             update_schema,
         ));
 
-        // Perform update_columns - this should NOT fail with type mismatch
-        // Previously this would error with:
+        // Perform update_columns - this should NOT fail with a type mismatch.
+        // Previously the JSON column would error with:
         //   "It is not possible to interleave arrays of different data types (Utf8 and LargeBinary)"
+        // and the view column would likewise mismatch (Utf8View vs stored Utf8).
         let mut fragment = dataset.get_fragment(0).unwrap();
         let (updated_fragment, fields_modified) = fragment
             .update_columns(right_stream, ROW_ID, ROW_ID)
