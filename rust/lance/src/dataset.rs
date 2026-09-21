@@ -92,6 +92,9 @@ mod take;
 pub mod transaction;
 pub mod udtf;
 mod update_join;
+#[cfg(feature = "update-join-bench")]
+#[doc(hidden)]
+pub mod update_join_bench;
 mod update_join_options;
 pub mod updater;
 mod utils;
