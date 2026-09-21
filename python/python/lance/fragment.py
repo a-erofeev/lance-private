@@ -806,6 +806,12 @@ class LanceFragment(pa.dataset.Fragment):
         left_on: str = "_rowid",
         right_on: Optional[str] = None,
         schema=None,
+        *,
+        strategy: Literal["auto", "hash", "sort_merge"] = "auto",
+        max_hash_rows: Optional[int] = None,
+        max_hash_bytes: Optional[int] = None,
+        external_memory_pool_bytes: Optional[int] = None,
+        max_temp_directory_bytes: Optional[int] = None,
     ) -> Tuple[FragmentMetadata, List[int]]:
         """
         Update existing columns in this fragment.
@@ -832,6 +838,23 @@ class LanceFragment(pa.dataset.Fragment):
             The name of the column in data_obj to join on. If None, defaults to left_on.
         schema: pa.Schema, optional
             The schema of the data. If not specified, the schema will be inferred.
+        strategy: {"auto", "hash", "sort_merge"}, default "auto"
+            The update join algorithm. ``auto`` selects an algorithm using the row and
+            estimated-memory thresholds.
+        max_hash_rows: int, optional
+            The largest right-side row count eligible for the hash path in ``auto``
+            mode. Must be specified together with ``max_hash_bytes``. The default is
+            250,000 rows.
+        max_hash_bytes: int, optional
+            The largest estimated right-side allocation eligible for the hash path in
+            ``auto`` mode. Must be specified together with ``max_hash_rows``. The
+            default is 1 GiB.
+        external_memory_pool_bytes: int, optional
+            The DataFusion memory-pool size for the spillable sort-merge path. This does
+            not bound total process memory. If unset, the operation uses the
+            ``LANCE_MEM_POOL_SIZE`` environment variable or defaults to 256 MiB.
+        max_temp_directory_bytes: int, optional
+            The maximum temporary spill-directory usage for the sort-merge path.
 
         Returns
         -------
@@ -897,7 +920,14 @@ class LanceFragment(pa.dataset.Fragment):
 
         reader = _coerce_reader(data_obj, schema)
         metadata, fields_modified = self._fragment.update_columns(
-            reader, left_on, right_on
+            reader,
+            left_on,
+            right_on,
+            strategy,
+            max_hash_rows,
+            max_hash_bytes,
+            external_memory_pool_bytes,
+            max_temp_directory_bytes,
         )
         return metadata, fields_modified
 

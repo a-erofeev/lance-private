@@ -13,7 +13,7 @@ use arrow_schema::{DataType, FieldRef, Schema as ArrowSchema, SchemaRef, SortOpt
 use datafusion::common::{JoinType, NullEquality};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::metrics::MetricValue;
+use datafusion::physical_plan::metrics::{ExecutionPlanMetricsSet, MetricValue};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -31,26 +31,30 @@ use lance_core::datatypes::{OnMissing, OnTypeMismatch, Schema};
 use lance_core::utils::address::RowAddress;
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::{
-    ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions, OneShotExec,
-    collect_execution_metrics, new_session_context,
+    ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
+    OneShotExec, collect_execution_metrics, new_session_context,
 };
+use lance_datafusion::spill::materialize_stream;
 use lance_datafusion::utils::reader_to_stream;
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
 
 use super::fragment::{FileFragment, FragmentUpdateColumnsResult};
 use super::hash_joiner::HashJoiner;
+use super::{UpdateJoinOptions, UpdateJoinStrategy};
 
 /// Row count used by scans, DataFusion operators, and the physical updater.
-const EXECUTION_BATCH_SIZE: usize = 1024;
-/// Largest RHS row count retained for the in-memory hash join.
-const DEFAULT_MAX_HASH_ROWS: usize = 1_000_000;
-/// Largest estimated RHS allocation retained for the in-memory hash join.
-const DEFAULT_MAX_HASH_BYTES: usize = 256 * 1024 * 1024;
+const EXECUTION_BATCH_SIZE: usize = 256;
+/// Default DataFusion memory pool per external-update execution partition.
+const DEFAULT_EXTERNAL_MEMORY_POOL_SIZE_PER_PARTITION: u64 = 256 * 1024 * 1024;
 /// Upper bound for each sort's spill-merge reservation.
 const MAX_SORT_MERGE_RESERVATION: usize = 10 * 1024 * 1024;
 /// Upper bound for a batch entering an external sort.
 const MAX_INPUT_BATCH_BYTES: usize = 25 * 1024 * 1024;
+/// Fraction of the external pool available to one input batch.
+const INPUT_BATCH_POOL_FRACTION: usize = 8;
+/// Fraction of the external pool used to retain one materialized pipeline stage in memory.
+const MATERIALIZATION_POOL_FRACTION: usize = 8;
 /// Number of partitions used by the current external update plan.
 ///
 /// TODO: Parallelize the key sorts and sort-merge join, then merge their output into the
@@ -60,33 +64,99 @@ const EXTERNAL_UPDATE_PARTITIONS: usize = 1;
 #[derive(Clone)]
 pub(super) struct UpdateColumnsOptions {
     pub(super) execution_options: LanceExecutionOptions,
+    pub(super) strategy: UpdateJoinStrategy,
     pub(super) max_hash_rows: usize,
     pub(super) max_hash_bytes: usize,
+    pub(super) execution_batch_size: usize,
+    pub(super) sort_spill_reservation_bytes: Option<usize>,
     #[cfg(test)]
     pub(super) session_context: Option<SessionContext>,
 }
 
 impl Default for UpdateColumnsOptions {
     fn default() -> Self {
+        Self::from_public(UpdateJoinOptions::default())
+    }
+}
+
+impl UpdateColumnsOptions {
+    fn from_public(options: UpdateJoinOptions) -> Self {
+        let mut execution_options = LanceExecutionOptions {
+            use_spilling: true,
+            mem_pool_size: options.external_memory_pool_bytes(),
+            max_temp_directory_size: options.max_temp_directory_bytes(),
+            target_partition: Some(EXTERNAL_UPDATE_PARTITIONS),
+            batch_size: Some(EXECUTION_BATCH_SIZE),
+            ..Default::default()
+        };
+        let resolved_pool_size = execution_options
+            .mem_pool_size_with_default(DEFAULT_EXTERNAL_MEMORY_POOL_SIZE_PER_PARTITION);
+        execution_options.mem_pool_size = Some(resolved_pool_size);
         Self {
-            execution_options: LanceExecutionOptions {
-                use_spilling: true,
-                target_partition: Some(EXTERNAL_UPDATE_PARTITIONS),
-                batch_size: Some(EXECUTION_BATCH_SIZE),
-                ..Default::default()
-            },
-            max_hash_rows: DEFAULT_MAX_HASH_ROWS,
-            max_hash_bytes: DEFAULT_MAX_HASH_BYTES,
+            execution_options,
+            strategy: options.strategy(),
+            max_hash_rows: options.max_hash_rows(),
+            max_hash_bytes: options.max_hash_bytes(),
+            execution_batch_size: EXECUTION_BATCH_SIZE,
+            sort_spill_reservation_bytes: None,
             #[cfg(test)]
             session_context: None,
         }
     }
+
+    fn validate(&self) -> Result<()> {
+        if self.execution_options.mem_pool_size == Some(0) {
+            return Err(Error::invalid_input(
+                "UpdateJoinOptions.external_memory_pool_bytes must be greater than zero, got 0"
+                    .to_string(),
+            ));
+        }
+        if self.execution_options.max_temp_directory_size == Some(0) {
+            return Err(Error::invalid_input(
+                "UpdateJoinOptions.max_temp_directory_bytes must be greater than zero, got 0"
+                    .to_string(),
+            ));
+        }
+        if self.execution_batch_size == 0 {
+            return Err(Error::invalid_input(
+                "UpdateColumnsOptions.execution_batch_size must be greater than zero, got 0"
+                    .to_string(),
+            ));
+        }
+        if self.sort_spill_reservation_bytes == Some(0) {
+            return Err(Error::invalid_input(
+                "UpdateColumnsOptions.sort_spill_reservation_bytes must be greater than zero, got 0"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl From<UpdateJoinOptions> for UpdateColumnsOptions {
+    fn from(options: UpdateJoinOptions) -> Self {
+        Self::from_public(options)
+    }
 }
 
 enum PreparedRhs {
-    Empty,
-    InMemory(Vec<RecordBatch>),
-    External(SendableRecordBatchStream),
+    Empty(RhsPreparationStats),
+    InMemory(Vec<RecordBatch>, RhsPreparationStats),
+    External(SendableRecordBatchStream, RhsPreparationStats),
+}
+
+#[derive(Clone, Copy)]
+struct RhsPreparationStats {
+    rows_at_selection: usize,
+    estimated_bytes_at_selection: usize,
+}
+
+struct ExternalUpdateOptions {
+    execution_options: LanceExecutionOptions,
+    execution_batch_size: usize,
+    sort_spill_reservation_bytes: Option<usize>,
+    session_context: Option<SessionContext>,
+    preparation_stats: RhsPreparationStats,
 }
 
 struct JsonConvertingReader {
@@ -168,10 +238,14 @@ async fn prepare_rhs(
         });
         prefetched.push(batch);
 
-        let is_within_limits = next_row_count
-            .zip(estimated_bytes)
-            .map(|(rows, bytes)| rows <= options.max_hash_rows && bytes <= hash_byte_budget)
-            .unwrap_or(false);
+        let is_within_limits = match options.strategy {
+            UpdateJoinStrategy::Auto => next_row_count
+                .zip(estimated_bytes)
+                .map(|(rows, bytes)| rows <= options.max_hash_rows && bytes <= hash_byte_budget)
+                .unwrap_or(false),
+            UpdateJoinStrategy::Hash => true,
+            UpdateJoinStrategy::SortMerge => false,
+        };
         row_count = next_row_count.unwrap_or(usize::MAX);
 
         if !is_within_limits {
@@ -185,15 +259,22 @@ async fn prepare_rhs(
             );
             let replay =
                 stream::iter(prefetched.into_iter().map(Ok::<_, DataFusionError>)).chain(unread);
-            return Ok(PreparedRhs::External(Box::pin(
-                RecordBatchStreamAdapter::new(schema, replay),
-            )));
+            return Ok(PreparedRhs::External(
+                Box::pin(RecordBatchStreamAdapter::new(schema, replay)),
+                RhsPreparationStats {
+                    rows_at_selection: row_count,
+                    estimated_bytes_at_selection: estimated_bytes.unwrap_or(usize::MAX),
+                },
+            ));
         }
     }
 
     if row_count == 0 {
         tracing::debug!(strategy = "empty", "selected update-columns join strategy");
-        return Ok(PreparedRhs::Empty);
+        return Ok(PreparedRhs::Empty(RhsPreparationStats {
+            rows_at_selection: 0,
+            estimated_bytes_at_selection: 0,
+        }));
     }
 
     let estimated_bytes = key_buffers
@@ -214,7 +295,24 @@ async fn prepare_rhs(
         resolved_pool_size,
         "selected update-columns join strategy"
     );
-    Ok(PreparedRhs::InMemory(prefetched))
+    Ok(PreparedRhs::InMemory(
+        prefetched,
+        RhsPreparationStats {
+            rows_at_selection: row_count,
+            estimated_bytes_at_selection: estimated_bytes,
+        },
+    ))
+}
+
+pub(super) async fn update_columns(
+    fragment: &mut FileFragment,
+    right_reader: Box<dyn RecordBatchReader + Send>,
+    left_on: &str,
+    right_on: &str,
+    options: UpdateJoinOptions,
+) -> Result<FragmentUpdateColumnsResult> {
+    options.validate()?;
+    update_columns_with_options(fragment, right_reader, left_on, right_on, options.into()).await
 }
 
 pub(super) async fn update_columns_with_options(
@@ -224,6 +322,7 @@ pub(super) async fn update_columns_with_options(
     right_on: &str,
     options: UpdateColumnsOptions,
 ) -> Result<FragmentUpdateColumnsResult> {
+    options.validate()?;
     if fragment.schema().field(left_on).is_none() && left_on != ROW_ID && left_on != ROW_ADDR {
         return Err(Error::invalid_input(format!(
             "Column {} does not exist in the left side fragment",
@@ -272,13 +371,20 @@ pub(super) async fn update_columns_with_options(
     validate_key_types(fragment, left_on, &right_schema, right_on)?;
 
     match prepare_rhs(right_reader, right_on, &options).await? {
-        PreparedRhs::Empty => Ok(FragmentUpdateColumnsResult {
-            fragment: fragment.metadata.clone(),
-            fields_modified: Vec::new(),
-            matched_offsets: RoaringBitmap::new(),
-        }),
-        PreparedRhs::InMemory(batches) => {
-            run_hash_update(
+        PreparedRhs::Empty(stats) => {
+            report_strategy_selection(
+                options.execution_options.execution_stats_callback.as_ref(),
+                "empty",
+                stats,
+            );
+            Ok(FragmentUpdateColumnsResult {
+                fragment: fragment.metadata.clone(),
+                fields_modified: Vec::new(),
+                matched_offsets: RoaringBitmap::new(),
+            })
+        }
+        PreparedRhs::InMemory(batches, stats) => {
+            let result = run_hash_update(
                 fragment,
                 batches,
                 right_schema,
@@ -286,9 +392,17 @@ pub(super) async fn update_columns_with_options(
                 right_on,
                 write_schema,
             )
-            .await
+            .await;
+            if result.is_ok() {
+                report_strategy_selection(
+                    options.execution_options.execution_stats_callback.as_ref(),
+                    "hash",
+                    stats,
+                );
+            }
+            result
         }
-        PreparedRhs::External(stream) => {
+        PreparedRhs::External(stream, stats) => {
             if !options.execution_options.use_spilling() {
                 return Err(Error::not_supported(
                     "A large fragment update requires DataFusion spill support, but spilling is disabled"
@@ -305,8 +419,13 @@ pub(super) async fn update_columns_with_options(
                 left_on,
                 right_on,
                 write_schema,
-                options.execution_options,
-                session_context,
+                ExternalUpdateOptions {
+                    execution_options: options.execution_options,
+                    execution_batch_size: options.execution_batch_size,
+                    sort_spill_reservation_bytes: options.sort_spill_reservation_bytes,
+                    session_context,
+                    preparation_stats: stats,
+                },
             )
             .await
         }
@@ -408,14 +527,28 @@ async fn run_external_update(
     left_on: &str,
     right_on: &str,
     write_schema: Schema,
-    mut execution_options: LanceExecutionOptions,
-    session_context: Option<SessionContext>,
+    options: ExternalUpdateOptions,
 ) -> Result<FragmentUpdateColumnsResult> {
-    execution_options.batch_size = Some(EXECUTION_BATCH_SIZE);
+    let ExternalUpdateOptions {
+        mut execution_options,
+        execution_batch_size,
+        sort_spill_reservation_bytes,
+        session_context,
+        preparation_stats,
+    } = options;
+    execution_options.batch_size = Some(execution_batch_size);
     execution_options.target_partition = Some(EXTERNAL_UPDATE_PARTITIONS);
     let pool_size = usize::try_from(execution_options.mem_pool_size()).unwrap_or(usize::MAX);
-    let sort_merge_reservation = MAX_SORT_MERGE_RESERVATION.min(pool_size / 8).max(1);
-    let input_batch_cap = MAX_INPUT_BATCH_BYTES.min(pool_size / 8).max(1);
+    let sort_spill_reservation_bytes = sort_spill_reservation_bytes
+        .unwrap_or_else(|| MAX_SORT_MERGE_RESERVATION.min(pool_size / 8).max(1));
+    if sort_spill_reservation_bytes >= pool_size {
+        return Err(Error::invalid_input(format!(
+            "UpdateColumnsOptions.sort_spill_reservation_bytes must be smaller than the external \
+             memory pool: reservation={sort_spill_reservation_bytes}, pool_size={pool_size}"
+        )));
+    }
+    let input_batch_cap = external_input_batch_cap(pool_size);
+    let materialization_memory_limit = pool_size / MATERIALIZATION_POOL_FRACTION;
     let input_batch_cap_u64 = u64::try_from(input_batch_cap).unwrap_or(u64::MAX);
     let temp_directory_limit = execution_options.max_temp_directory_size();
     if temp_directory_limit < input_batch_cap_u64 {
@@ -433,7 +566,7 @@ async fn run_external_update(
     }
     scanner
         .project(&left_projection)?
-        .batch_size(EXECUTION_BATCH_SIZE)
+        .batch_size(execution_batch_size)
         .batch_size_bytes(u64::try_from(input_batch_cap).unwrap_or(u64::MAX));
     let left_stream = scanner.try_into_dfstream(execution_options.clone()).await?;
 
@@ -443,8 +576,8 @@ async fn run_external_update(
         .config_mut()
         .options_mut()
         .execution
-        .sort_spill_reservation_bytes = sort_merge_reservation;
-    state.config_mut().options_mut().execution.batch_size = EXECUTION_BATCH_SIZE;
+        .sort_spill_reservation_bytes = sort_spill_reservation_bytes;
+    state.config_mut().options_mut().execution.batch_size = execution_batch_size;
     let task_context = state.task_ctx();
 
     let left_source = Arc::new(OneShotExec::new(left_stream)) as Arc<dyn ExecutionPlan>;
@@ -455,8 +588,14 @@ async fn run_external_update(
 
     let sorted_right_stream = sorted_right.execute(0, task_context.clone())?;
     let deduplicated_right = deduplicate_sorted_stream(sorted_right_stream, right_on)?;
-    let deduplicated_right =
-        Arc::new(OneShotExec::new(deduplicated_right)) as Arc<dyn ExecutionPlan>;
+    let (deduplicated_right, right_materialization_metrics) = materialize_stream(
+        deduplicated_right,
+        task_context.runtime_env(),
+        materialization_memory_limit,
+        "materializing sorted update RHS",
+    )
+    .await?;
+    let deduplicated_right = Arc::new(OneShotExec::new(deduplicated_right));
 
     let left_key_index = sorted_left.schema().index_of(left_on)?;
     let right_key_index = right_schema.index_of(right_on)?;
@@ -497,7 +636,17 @@ async fn run_external_update(
         projected_patches,
         input_batch_cap,
     )) as Arc<dyn ExecutionPlan>;
-    let sorted_patches = sort_by_column_without_cap(capped_patches, ROW_ADDR)?;
+    let unsorted_patch_stream = capped_patches.execute(0, task_context.clone())?;
+    let (unsorted_patch_stream, patch_materialization_metrics) = materialize_stream(
+        unsorted_patch_stream,
+        task_context.runtime_env(),
+        materialization_memory_limit,
+        "materializing unsorted update patches",
+    )
+    .await?;
+    let unsorted_patches =
+        Arc::new(OneShotExec::new(unsorted_patch_stream)) as Arc<dyn ExecutionPlan>;
+    let sorted_patches = sort_by_column_without_cap(unsorted_patches, ROW_ADDR)?;
     let patch_stream = sorted_patches.execute(0, task_context)?;
 
     let fragment_id = fragment_id(fragment)?;
@@ -514,7 +663,11 @@ async fn run_external_update(
         .updater(
             Some(&update_projection),
             Some((write_schema, fragment.schema().clone())),
-            Some(EXECUTION_BATCH_SIZE as u32),
+            Some(u32::try_from(execution_batch_size).map_err(|_| {
+                Error::invalid_input(format!(
+                    "UpdateColumnsOptions.execution_batch_size exceeds u32: {execution_batch_size}"
+                ))
+            })?),
         )
         .await?;
     let mut matched_offsets = RoaringBitmap::new();
@@ -532,15 +685,64 @@ async fn run_external_update(
 
     if let Some(callback) = execution_options.execution_stats_callback.as_ref() {
         let mut counts = ExecutionSummaryCounts::default();
+        record_strategy_selection(&mut counts, "sort_merge", preparation_stats);
         collect_execution_metrics(sorted_right.as_ref(), &mut counts);
-        collect_spill_metrics(sorted_right.as_ref(), &mut counts);
+        collect_spill_metrics(sorted_right.as_ref(), &mut counts, "rhs_sort");
+        collect_metric_set(
+            &right_materialization_metrics,
+            &mut counts,
+            "rhs_materialization",
+        );
+        collect_execution_metrics(capped_patches.as_ref(), &mut counts);
+        collect_spill_metrics(capped_patches.as_ref(), &mut counts, "join_pipeline");
+        collect_metric_set(
+            &patch_materialization_metrics,
+            &mut counts,
+            "patch_materialization",
+        );
         collect_execution_metrics(sorted_patches.as_ref(), &mut counts);
-        collect_spill_metrics(sorted_patches.as_ref(), &mut counts);
+        collect_spill_metrics(sorted_patches.as_ref(), &mut counts, "patch_sort");
         callback(&counts);
     }
 
     let updated_fragment = updater.finish().await?;
     finalize_update(updated_fragment, matched_offsets)
+}
+
+fn external_input_batch_cap(pool_size: usize) -> usize {
+    MAX_INPUT_BATCH_BYTES
+        .min(pool_size / INPUT_BATCH_POOL_FRACTION)
+        .max(1)
+}
+
+fn report_strategy_selection(
+    callback: Option<&ExecutionStatsCallback>,
+    strategy: &str,
+    stats: RhsPreparationStats,
+) {
+    if let Some(callback) = callback {
+        let mut counts = ExecutionSummaryCounts::default();
+        record_strategy_selection(&mut counts, strategy, stats);
+        callback(&counts);
+    }
+}
+
+fn record_strategy_selection(
+    counts: &mut ExecutionSummaryCounts,
+    strategy: &str,
+    stats: RhsPreparationStats,
+) {
+    counts
+        .all_counts
+        .insert(format!("update_join_strategy_{strategy}"), 1);
+    counts.all_counts.insert(
+        "update_join_rhs_rows_at_selection".to_string(),
+        stats.rows_at_selection,
+    );
+    counts.all_counts.insert(
+        "update_join_rhs_estimated_bytes_at_selection".to_string(),
+        stats.estimated_bytes_at_selection,
+    );
 }
 
 fn sort_by_column(
@@ -567,7 +769,11 @@ fn sort_by_column_without_cap(
     Ok(Arc::new(SortExec::new([sort_expression].into(), input)))
 }
 
-fn collect_spill_metrics(plan: &dyn ExecutionPlan, counts: &mut ExecutionSummaryCounts) {
+fn collect_spill_metrics(
+    plan: &dyn ExecutionPlan,
+    counts: &mut ExecutionSummaryCounts,
+    stage: &str,
+) {
     if let Some(metrics) = plan.metrics() {
         for metric in metrics.iter() {
             let (name, value) = match metric.value() {
@@ -576,12 +782,36 @@ fn collect_spill_metrics(plan: &dyn ExecutionPlan, counts: &mut ExecutionSummary
                 MetricValue::SpilledRows(value) => ("spilled_rows", value.value()),
                 _ => continue,
             };
-            *counts.all_counts.entry(name.to_string()).or_default() += value;
+            record_spill_metric(counts, stage, name, value);
         }
     }
     for child in plan.children() {
-        collect_spill_metrics(child.as_ref(), counts);
+        collect_spill_metrics(child.as_ref(), counts, stage);
     }
+}
+
+fn collect_metric_set(
+    metrics: &ExecutionPlanMetricsSet,
+    counts: &mut ExecutionSummaryCounts,
+    stage: &str,
+) {
+    for metric in metrics.clone_inner().iter() {
+        let (name, value) = match metric.value() {
+            MetricValue::SpillCount(value) => ("spill_count", value.value()),
+            MetricValue::SpilledBytes(value) => ("spilled_bytes", value.value()),
+            MetricValue::SpilledRows(value) => ("spilled_rows", value.value()),
+            _ => continue,
+        };
+        record_spill_metric(counts, stage, name, value);
+    }
+}
+
+fn record_spill_metric(counts: &mut ExecutionSummaryCounts, stage: &str, name: &str, value: usize) {
+    *counts.all_counts.entry(name.to_string()).or_default() += value;
+    *counts
+        .all_counts
+        .entry(format!("update_join_{stage}_{name}"))
+        .or_default() += value;
 }
 
 struct DedupState {
@@ -977,8 +1207,8 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_rhs_limits_and_empty_batches() {
         let defaults = UpdateColumnsOptions::default();
-        assert_eq!(defaults.max_hash_rows, 1_000_000);
-        assert_eq!(defaults.max_hash_bytes, 256 * 1024 * 1024);
+        assert_eq!(defaults.max_hash_rows, 250_000);
+        assert_eq!(defaults.max_hash_bytes, 1024 * 1024 * 1024);
 
         let batch = record_batch!(("key", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
         let schema = batch.schema();
@@ -990,7 +1220,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(prepared, PreparedRhs::InMemory(batches) if batches.len() == 1));
+        assert!(matches!(
+            prepared,
+            PreparedRhs::InMemory(batches, stats)
+                if batches.len() == 1
+                    && stats.rows_at_selection == 2
+                    && stats.estimated_bytes_at_selection > 0
+        ));
 
         let prepared = prepare_rhs(
             reader(schema.clone(), vec![Ok(batch.clone())]),
@@ -999,7 +1235,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(prepared, PreparedRhs::External(_)));
+        assert!(matches!(
+            prepared,
+            PreparedRhs::External(_, stats)
+                if stats.rows_at_selection == 2
+                    && stats.estimated_bytes_at_selection > 0
+        ));
 
         let prepared = prepare_rhs(
             reader(schema.clone(), vec![Ok(batch)]),
@@ -1008,12 +1249,23 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(prepared, PreparedRhs::External(_)));
+        assert!(matches!(
+            prepared,
+            PreparedRhs::External(_, stats)
+                if stats.rows_at_selection == 2
+                    && stats.estimated_bytes_at_selection > 1
+        ));
 
         let prepared = prepare_rhs(reader(schema.clone(), vec![]), "key", &options(1, 1))
             .await
             .unwrap();
-        assert!(matches!(prepared, PreparedRhs::Empty));
+        assert!(matches!(
+            prepared,
+            PreparedRhs::Empty(RhsPreparationStats {
+                rows_at_selection: 0,
+                estimated_bytes_at_selection: 0
+            })
+        ));
 
         let empty = RecordBatch::new_empty(schema.clone());
         let prepared = prepare_rhs(
@@ -1023,7 +1275,88 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(prepared, PreparedRhs::Empty));
+        assert!(matches!(
+            prepared,
+            PreparedRhs::Empty(RhsPreparationStats {
+                rows_at_selection: 0,
+                estimated_bytes_at_selection: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn test_record_strategy_selection() {
+        let mut counts = ExecutionSummaryCounts::default();
+        record_strategy_selection(
+            &mut counts,
+            "sort_merge",
+            RhsPreparationStats {
+                rows_at_selection: 1_003_520,
+                estimated_bytes_at_selection: 96_337_920,
+            },
+        );
+
+        assert_eq!(counts.all_counts["update_join_strategy_sort_merge"], 1);
+        assert_eq!(
+            counts.all_counts["update_join_rhs_rows_at_selection"],
+            1_003_520
+        );
+        assert_eq!(
+            counts.all_counts["update_join_rhs_estimated_bytes_at_selection"],
+            96_337_920
+        );
+    }
+
+    #[test]
+    fn test_external_input_batch_cap_tracks_pool_size() {
+        const MIB: usize = 1024 * 1024;
+
+        assert_eq!(external_input_batch_cap(150 * MIB), 150 * MIB / 8);
+        assert_eq!(external_input_batch_cap(200 * MIB), 25 * MIB);
+        assert_eq!(external_input_batch_cap(0), 1);
+    }
+
+    #[test]
+    fn test_external_execution_defaults_and_explicit_pool() {
+        const MIB: u64 = 1024 * 1024;
+
+        let defaults = UpdateColumnsOptions::from_public(
+            UpdateJoinOptions::default().with_strategy(UpdateJoinStrategy::SortMerge),
+        );
+        assert_eq!(defaults.execution_batch_size, 256);
+        assert_eq!(defaults.execution_options.batch_size, Some(256));
+        assert_eq!(defaults.execution_options.mem_pool_size, Some(256 * MIB));
+
+        let configured = UpdateColumnsOptions::from_public(
+            UpdateJoinOptions::default()
+                .with_strategy(UpdateJoinStrategy::SortMerge)
+                .with_external_memory_pool_bytes(384 * MIB),
+        );
+        assert_eq!(configured.execution_options.mem_pool_size, Some(384 * MIB));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_strategy_overrides_auto_thresholds() {
+        let batch = record_batch!(("key", Int32, [1, 2]), ("value", Int32, [10, 20])).unwrap();
+        let schema = batch.schema();
+
+        let mut force_hash = options(0, 0);
+        force_hash.strategy = UpdateJoinStrategy::Hash;
+        let prepared = prepare_rhs(
+            reader(schema.clone(), vec![Ok(batch.clone())]),
+            "key",
+            &force_hash,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(prepared, PreparedRhs::InMemory(_, _)));
+
+        let mut force_sort_merge = options(usize::MAX, usize::MAX);
+        force_sort_merge.strategy = UpdateJoinStrategy::SortMerge;
+        let prepared = prepare_rhs(reader(schema, vec![Ok(batch)]), "key", &force_sort_merge)
+            .await
+            .unwrap();
+        assert!(matches!(prepared, PreparedRhs::External(_, _)));
     }
 
     #[rstest]
@@ -1076,7 +1409,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let PreparedRhs::External(mut replayed) = prepared else {
+        let PreparedRhs::External(mut replayed, _) = prepared else {
             panic!("row limit should select external preparation");
         };
         assert_eq!(replayed.next().await.unwrap().unwrap(), batch);
@@ -1755,7 +2088,7 @@ mod tests {
             .collect::<Vec<_>>();
         let update_schema = update_batches[0].schema();
 
-        let reported_spills = Arc::new(Mutex::new((0usize, 0usize)));
+        let reported_spills = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
         let callback_spills = reported_spills.clone();
         let execution_options = LanceExecutionOptions {
             use_spilling: true,
@@ -1767,6 +2100,16 @@ mod tests {
                 let mut reported = callback_spills.lock().unwrap();
                 reported.0 += counts.all_counts.get("spill_count").copied().unwrap_or(0);
                 reported.1 += counts.all_counts.get("spilled_bytes").copied().unwrap_or(0);
+                reported.2 += [
+                    "update_join_rhs_sort_spilled_bytes",
+                    "update_join_rhs_materialization_spilled_bytes",
+                    "update_join_join_pipeline_spilled_bytes",
+                    "update_join_patch_materialization_spilled_bytes",
+                    "update_join_patch_sort_spilled_bytes",
+                ]
+                .iter()
+                .filter_map(|name| counts.all_counts.get(*name))
+                .sum::<usize>();
             })),
             skip_logging: true,
         };
@@ -1782,9 +2125,9 @@ mod tests {
             "key",
             UpdateColumnsOptions {
                 execution_options,
-                max_hash_rows: 0,
-                max_hash_bytes: usize::MAX,
+                strategy: UpdateJoinStrategy::SortMerge,
                 session_context: Some(session.clone()),
+                ..Default::default()
             },
         )
         .await
@@ -1792,6 +2135,10 @@ mod tests {
         let reported_spills = *reported_spills.lock().unwrap();
         assert!(reported_spills.0 > 0, "no sort spill files were reported");
         assert!(reported_spills.1 > 0, "no spilled bytes were reported");
+        assert_eq!(
+            reported_spills.1, reported_spills.2,
+            "stage-labelled spill bytes did not sum to the total"
+        );
 
         let updated_fragment = FileFragment::new(Arc::new(dataset.clone()), result.fragment);
         let batch = updated_fragment.scan().try_into_batch().await.unwrap();
@@ -1831,9 +2178,9 @@ mod tests {
             "key",
             UpdateColumnsOptions {
                 execution_options: low_disk_options,
-                max_hash_rows: 0,
-                max_hash_bytes: usize::MAX,
+                strategy: UpdateJoinStrategy::SortMerge,
                 session_context: Some(low_disk_session.clone()),
+                ..Default::default()
             },
         )
         .await

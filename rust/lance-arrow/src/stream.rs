@@ -167,7 +167,17 @@ fn slice_batch(
     let batch_bytes = batch.get_array_memory_size();
     let num_rows = batch.num_rows();
 
-    if batch_bytes <= max_bytes || num_rows <= 1 {
+    if batch_bytes <= max_bytes {
+        return Ok(vec![batch]);
+    }
+    if num_rows <= 1 {
+        // A one-row batch can still retain a much larger parent's buffers. Copy it once so the
+        // caller can distinguish that case from a genuinely oversized row without recursing.
+        let batch = if deep_copy {
+            deep_copy_batch_sliced(&batch)?
+        } else {
+            batch
+        };
         return Ok(vec![batch]);
     }
 
@@ -284,6 +294,29 @@ mod tests {
             result.len() >= 4,
             "expected at least 4 slices, got {}",
             result.len()
+        );
+    }
+
+    #[test]
+    fn test_single_row_slice_is_deep_copied() {
+        let batch = make_batch(1_000);
+        let sliced = batch.slice(500, 1);
+        let max_bytes = 256;
+        assert!(sliced.get_array_memory_size() > max_bytes);
+
+        let input = stream::iter(vec![Ok::<_, ArrowError>(sliced)]);
+        let rechunked = rechunk_stream_by_size_deep_copy(input, test_schema(), 0, max_bytes);
+        let result = block_on(rechunked.collect::<Vec<_>>())
+            .into_iter()
+            .map(|result| result.unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 1);
+        let result_bytes = result[0].get_array_memory_size();
+        assert!(
+            result_bytes <= max_bytes,
+            "deep-copied row uses {result_bytes} bytes, expected at most {max_bytes}"
         );
     }
 

@@ -62,15 +62,15 @@ use super::scanner::Scanner;
 
 use super::updater::Updater;
 use super::{NewColumnTransform, WriteParams, schema_evolution};
-use crate::dataset::Dataset;
 use crate::dataset::fragment::session::FragmentSession;
 use crate::dataset::overlay::{
     OverlayReadPlanner, merge_overlay_batch, plan_overlays, resolve_overlays,
 };
+use crate::dataset::{Dataset, UpdateJoinOptions};
 use crate::io::deletion::read_dataset_deletion_file;
 
-/// Result of [`FileFragment::update_columns_with_offsets`]: updated fragment metadata, modified field ids,
-/// and physical row offsets that matched the join (for stable row-id version metadata).
+/// Result of a fragment column update: updated fragment metadata, modified field ids, and physical
+/// row offsets that matched the join (for stable row-id version metadata).
 #[derive(Debug, Clone)]
 pub struct FragmentUpdateColumnsResult {
     pub fragment: Fragment,
@@ -1867,14 +1867,48 @@ impl FileFragment {
         left_on: &str,
         right_on: &str,
     ) -> Result<FragmentUpdateColumnsResult> {
-        super::update_join::update_columns_with_options(
-            self,
-            Box::new(right_stream),
+        self.update_columns_with_options(
+            right_stream,
             left_on,
             right_on,
-            Default::default(),
+            UpdateJoinOptions::default(),
         )
         .await
+    }
+
+    /// Updates columns using explicit join-strategy and external-resource controls.
+    ///
+    /// The returned offsets are physical row offsets within this fragment. Existing callers can
+    /// continue to use [`Self::update_columns`] or [`Self::update_columns_with_offsets`], which use
+    /// [`UpdateJoinOptions::default`].
+    ///
+    /// ```
+    /// # use arrow_array::RecordBatchReader;
+    /// # use lance::Result;
+    /// # use lance::dataset::UpdateJoinOptions;
+    /// # use lance::dataset::fragment::FileFragment;
+    /// # async fn update(
+    /// #     fragment: &mut FileFragment,
+    /// #     updates: impl RecordBatchReader + Send + 'static,
+    /// # ) -> Result<()> {
+    /// let options = UpdateJoinOptions::default()
+    ///     .with_hash_thresholds(500_000, 1024 * 1024 * 1024)
+    ///     .with_external_memory_pool_bytes(256 * 1024 * 1024);
+    /// fragment
+    ///     .update_columns_with_options(updates, "id", "id", options)
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn update_columns_with_options(
+        &mut self,
+        right_stream: impl RecordBatchReader + Send + 'static,
+        left_on: &str,
+        right_on: &str,
+        options: UpdateJoinOptions,
+    ) -> Result<FragmentUpdateColumnsResult> {
+        super::update_join::update_columns(self, Box::new(right_stream), left_on, right_on, options)
+            .await
     }
 
     /// Append new columns to the fragment
