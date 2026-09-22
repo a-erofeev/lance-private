@@ -3,6 +3,8 @@
 
 //! Bounded-memory implementation of fragment column updates.
 
+mod late_materialize;
+
 use std::sync::Arc;
 
 use arrow_array::{
@@ -34,7 +36,7 @@ use lance_datafusion::exec::{
     ExecutionStatsCallback, ExecutionSummaryCounts, HardCapBatchSizeExec, LanceExecutionOptions,
     OneShotExec, collect_execution_metrics, new_session_context,
 };
-use lance_datafusion::spill::materialize_stream;
+use lance_datafusion::spill::{materialize_replayable_stream, materialize_stream};
 use lance_datafusion::utils::reader_to_stream;
 use lance_table::format::Fragment;
 use roaring::RoaringBitmap;
@@ -42,6 +44,9 @@ use roaring::RoaringBitmap;
 use super::fragment::{FileFragment, FragmentUpdateColumnsResult};
 use super::hash_joiner::HashJoiner;
 use super::{UpdateJoinOptions, UpdateJoinStrategy};
+use late_materialize::{
+    enumerate_stream, materialize_payloads, project_stream, unique_column_name,
+};
 
 /// Row count used by scans, DataFusion operators, and the physical updater.
 const EXECUTION_BATCH_SIZE: usize = 256;
@@ -60,6 +65,8 @@ const MATERIALIZATION_POOL_FRACTION: usize = 8;
 /// TODO: Parallelize the key sorts and sort-merge join, then merge their output into the
 /// single globally row-address-ordered patch stream required by [`SortedPatchCursor`].
 const EXTERNAL_UPDATE_PARTITIONS: usize = 1;
+/// Base name for the synthetic ordinal used to recover RHS payloads after narrow-key sorts.
+const RHS_ROW_ID_BASE: &str = "__lance_update_rhs_row_id";
 
 #[derive(Clone)]
 pub(super) struct UpdateColumnsOptions {
@@ -559,6 +566,40 @@ async fn run_external_update(
         .into());
     }
 
+    let session = session_context.unwrap_or_else(|| new_session_context(&execution_options));
+    let mut state = session.state();
+    state
+        .config_mut()
+        .options_mut()
+        .execution
+        .sort_spill_reservation_bytes = sort_spill_reservation_bytes;
+    state.config_mut().options_mut().execution.batch_size = execution_batch_size;
+    let task_context = state.task_ctx();
+
+    let right_schema = right_stream.schema();
+    let rhs_row_id_name = unique_column_name(&right_schema, RHS_ROW_ID_BASE);
+    let numbered_right = enumerate_stream(right_stream, rhs_row_id_name.clone());
+    let capped_numbered_right = Arc::new(HardCapBatchSizeExec::new(
+        Arc::new(OneShotExec::new(numbered_right)),
+        input_batch_cap,
+    )) as Arc<dyn ExecutionPlan>;
+    let numbered_right_stream = capped_numbered_right.execute(0, task_context.clone())?;
+    let numbered_right_schema = capped_numbered_right.schema();
+    let right_key_index = numbered_right_schema.index_of(right_on)?;
+    let right_row_id_index = numbered_right_schema.index_of(&rhs_row_id_name)?;
+    let (right_payloads, rhs_payload_materialization_metrics) = materialize_replayable_stream(
+        numbered_right_stream,
+        task_context.runtime_env(),
+        materialization_memory_limit,
+        "materializing update RHS payloads",
+    )
+    .await?;
+    let narrow_right = project_stream(
+        right_payloads.read()?,
+        vec![right_key_index, right_row_id_index],
+    )?;
+    let narrow_right_schema = narrow_right.schema();
+
     let mut scanner = fragment.scan();
     let mut left_projection = vec![left_on];
     if left_on != ROW_ADDR {
@@ -570,19 +611,8 @@ async fn run_external_update(
         .batch_size_bytes(u64::try_from(input_batch_cap).unwrap_or(u64::MAX));
     let left_stream = scanner.try_into_dfstream(execution_options.clone()).await?;
 
-    let session = session_context.unwrap_or_else(|| new_session_context(&execution_options));
-    let mut state = session.state();
-    state
-        .config_mut()
-        .options_mut()
-        .execution
-        .sort_spill_reservation_bytes = sort_spill_reservation_bytes;
-    state.config_mut().options_mut().execution.batch_size = execution_batch_size;
-    let task_context = state.task_ctx();
-
     let left_source = Arc::new(OneShotExec::new(left_stream)) as Arc<dyn ExecutionPlan>;
-    let right_schema = right_stream.schema();
-    let right_source = Arc::new(OneShotExec::new(right_stream)) as Arc<dyn ExecutionPlan>;
+    let right_source = Arc::new(OneShotExec::new(narrow_right)) as Arc<dyn ExecutionPlan>;
     let sorted_left = sort_by_column(left_source, left_on, input_batch_cap)?;
     let sorted_right = sort_by_column(right_source, right_on, input_batch_cap)?;
 
@@ -598,7 +628,7 @@ async fn run_external_update(
     let deduplicated_right = Arc::new(OneShotExec::new(deduplicated_right));
 
     let left_key_index = sorted_left.schema().index_of(left_on)?;
-    let right_key_index = right_schema.index_of(right_on)?;
+    let right_key_index = narrow_right_schema.index_of(right_on)?;
     let join = Arc::new(SortMergeJoinExec::try_new(
         sorted_left.clone(),
         deduplicated_right,
@@ -617,36 +647,60 @@ async fn run_external_update(
 
     let left_column_count = sorted_left.schema().fields().len();
     let left_address_index = sorted_left.schema().index_of(ROW_ADDR)?;
-    let mut patch_projection = Vec::with_capacity(write_schema.fields.len() + 1);
-    patch_projection.push((
-        Arc::new(Column::new(ROW_ADDR, left_address_index)) as Arc<dyn PhysicalExpr>,
-        ROW_ADDR.to_string(),
-    ));
-    for field in &write_schema.fields {
-        let right_index = right_schema.index_of(&field.name)?;
-        patch_projection.push((
-            Arc::new(Column::new(&field.name, left_column_count + right_index))
-                as Arc<dyn PhysicalExpr>,
-            field.name.clone(),
-        ));
-    }
-    let projected_patches =
-        Arc::new(ProjectionExec::try_new(patch_projection, join)?) as Arc<dyn ExecutionPlan>;
-    let capped_patches = Arc::new(HardCapBatchSizeExec::new(
-        projected_patches,
+    let right_row_id_index = narrow_right_schema.index_of(&rhs_row_id_name)?;
+    let patch_mapping_projection = vec![
+        (
+            Arc::new(Column::new(ROW_ADDR, left_address_index)) as Arc<dyn PhysicalExpr>,
+            ROW_ADDR.to_string(),
+        ),
+        (
+            Arc::new(Column::new(
+                &rhs_row_id_name,
+                left_column_count + right_row_id_index,
+            )) as Arc<dyn PhysicalExpr>,
+            rhs_row_id_name.clone(),
+        ),
+    ];
+    let projected_patch_mappings =
+        Arc::new(ProjectionExec::try_new(patch_mapping_projection, join)?)
+            as Arc<dyn ExecutionPlan>;
+    let capped_patch_mappings = Arc::new(HardCapBatchSizeExec::new(
+        projected_patch_mappings,
         input_batch_cap,
     )) as Arc<dyn ExecutionPlan>;
-    let unsorted_patch_stream = capped_patches.execute(0, task_context.clone())?;
-    let (unsorted_patch_stream, patch_materialization_metrics) = materialize_stream(
-        unsorted_patch_stream,
+    let unsorted_patch_mappings = capped_patch_mappings.execute(0, task_context.clone())?;
+    let (unsorted_patch_mappings, patch_materialization_metrics) = materialize_stream(
+        unsorted_patch_mappings,
         task_context.runtime_env(),
         materialization_memory_limit,
-        "materializing unsorted update patches",
+        "materializing unsorted update patch mappings",
     )
     .await?;
-    let unsorted_patches =
-        Arc::new(OneShotExec::new(unsorted_patch_stream)) as Arc<dyn ExecutionPlan>;
-    let sorted_patches = sort_by_column_without_cap(unsorted_patches, ROW_ADDR)?;
+    let unsorted_patch_mappings =
+        Arc::new(OneShotExec::new(unsorted_patch_mappings)) as Arc<dyn ExecutionPlan>;
+    // Payload materialization retains every source batch referenced by one mapping batch.
+    // Keep the mapping batches capped so a large in-memory sort output cannot retain a wide
+    // fraction of the RHS while it is interleaved.
+    let sorted_patch_mappings =
+        sort_by_column(unsorted_patch_mappings, &rhs_row_id_name, input_batch_cap)?;
+    let sorted_patch_mapping_stream = sorted_patch_mappings.execute(0, task_context.clone())?;
+    let (sorted_patch_mapping_stream, patch_mapping_materialization_metrics) = materialize_stream(
+        sorted_patch_mapping_stream,
+        task_context.runtime_env(),
+        materialization_memory_limit,
+        "materializing RHS-row-ordered update patch mappings",
+    )
+    .await?;
+
+    let payload_schema = Arc::new(ArrowSchema::from(&write_schema));
+    let patches = materialize_payloads(
+        sorted_patch_mapping_stream,
+        right_payloads.read()?,
+        &rhs_row_id_name,
+        payload_schema,
+    )?;
+    let unsorted_patches = Arc::new(OneShotExec::new(patches)) as Arc<dyn ExecutionPlan>;
+    let sorted_patches = sort_by_column(unsorted_patches, ROW_ADDR, input_batch_cap)?;
     let patch_stream = sorted_patches.execute(0, task_context)?;
 
     let fragment_id = fragment_id(fragment)?;
@@ -686,6 +740,12 @@ async fn run_external_update(
     if let Some(callback) = execution_options.execution_stats_callback.as_ref() {
         let mut counts = ExecutionSummaryCounts::default();
         record_strategy_selection(&mut counts, "sort_merge", preparation_stats);
+        collect_execution_metrics(capped_numbered_right.as_ref(), &mut counts);
+        collect_metric_set(
+            &rhs_payload_materialization_metrics,
+            &mut counts,
+            "rhs_payload_materialization",
+        );
         collect_execution_metrics(sorted_right.as_ref(), &mut counts);
         collect_spill_metrics(sorted_right.as_ref(), &mut counts, "rhs_sort");
         collect_metric_set(
@@ -693,12 +753,23 @@ async fn run_external_update(
             &mut counts,
             "rhs_materialization",
         );
-        collect_execution_metrics(capped_patches.as_ref(), &mut counts);
-        collect_spill_metrics(capped_patches.as_ref(), &mut counts, "join_pipeline");
+        collect_execution_metrics(capped_patch_mappings.as_ref(), &mut counts);
+        collect_spill_metrics(capped_patch_mappings.as_ref(), &mut counts, "join_pipeline");
         collect_metric_set(
             &patch_materialization_metrics,
             &mut counts,
             "patch_materialization",
+        );
+        collect_execution_metrics(sorted_patch_mappings.as_ref(), &mut counts);
+        collect_spill_metrics(
+            sorted_patch_mappings.as_ref(),
+            &mut counts,
+            "patch_mapping_sort",
+        );
+        collect_metric_set(
+            &patch_mapping_materialization_metrics,
+            &mut counts,
+            "patch_mapping_materialization",
         );
         collect_execution_metrics(sorted_patches.as_ref(), &mut counts);
         collect_spill_metrics(sorted_patches.as_ref(), &mut counts, "patch_sort");
@@ -2088,7 +2159,7 @@ mod tests {
             .collect::<Vec<_>>();
         let update_schema = update_batches[0].schema();
 
-        let reported_spills = Arc::new(Mutex::new((0usize, 0usize, 0usize)));
+        let reported_spills = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0usize, 0usize)));
         let callback_spills = reported_spills.clone();
         let execution_options = LanceExecutionOptions {
             use_spilling: true,
@@ -2101,15 +2172,28 @@ mod tests {
                 reported.0 += counts.all_counts.get("spill_count").copied().unwrap_or(0);
                 reported.1 += counts.all_counts.get("spilled_bytes").copied().unwrap_or(0);
                 reported.2 += [
+                    "update_join_rhs_payload_materialization_spilled_bytes",
                     "update_join_rhs_sort_spilled_bytes",
                     "update_join_rhs_materialization_spilled_bytes",
                     "update_join_join_pipeline_spilled_bytes",
                     "update_join_patch_materialization_spilled_bytes",
+                    "update_join_patch_mapping_sort_spilled_bytes",
+                    "update_join_patch_mapping_materialization_spilled_bytes",
                     "update_join_patch_sort_spilled_bytes",
                 ]
                 .iter()
                 .filter_map(|name| counts.all_counts.get(*name))
                 .sum::<usize>();
+                reported.3 += counts
+                    .all_counts
+                    .get("update_join_rhs_payload_materialization_spilled_bytes")
+                    .copied()
+                    .unwrap_or(0);
+                reported.4 += counts
+                    .all_counts
+                    .get("update_join_rhs_sort_spilled_bytes")
+                    .copied()
+                    .unwrap_or(0);
             })),
             skip_logging: true,
         };
@@ -2138,6 +2222,16 @@ mod tests {
         assert_eq!(
             reported_spills.1, reported_spills.2,
             "stage-labelled spill bytes did not sum to the total"
+        );
+        assert!(
+            reported_spills.3 > 0,
+            "wide RHS payload materialization did not spill"
+        );
+        assert!(
+            reported_spills.4 < reported_spills.3,
+            "narrow RHS sort spilled {} bytes, expected less than the {}-byte wide payload",
+            reported_spills.4,
+            reported_spills.3
         );
 
         let updated_fragment = FileFragment::new(Arc::new(dataset.clone()), result.fragment);

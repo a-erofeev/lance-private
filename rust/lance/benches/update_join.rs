@@ -158,6 +158,8 @@ enum ScenarioName {
     Wide1024,
     Wide2048,
     Wide4096,
+    Wide8192,
+    Wide16384,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -217,6 +219,8 @@ impl Scenario {
             ScenarioName::Wide1024 => Some(1_024),
             ScenarioName::Wide2048 => Some(2_048),
             ScenarioName::Wide4096 => Some(4_096),
+            ScenarioName::Wide8192 => Some(8_192),
+            ScenarioName::Wide16384 => Some(16_384),
             _ => None,
         }
     }
@@ -280,6 +284,8 @@ impl ScenarioName {
             Self::Wide1024 => wide_memory(1_024),
             Self::Wide2048 => wide_memory(2_048),
             Self::Wide4096 => wide_memory(4_096),
+            Self::Wide8192 => wide_memory(8_192),
+            Self::Wide16384 => wide_memory(16_384),
         }
     }
 
@@ -305,6 +311,8 @@ impl ScenarioName {
             Self::Wide1024 => "wide1024",
             Self::Wide2048 => "wide2048",
             Self::Wide4096 => "wide4096",
+            Self::Wide8192 => "wide8192",
+            Self::Wide16384 => "wide16384",
         }
     }
 }
@@ -607,6 +615,9 @@ struct BenchmarkRecord {
     spill_count: usize,
     spilled_rows: usize,
     spilled_bytes: usize,
+    rhs_payload_materialization_spill_count: usize,
+    rhs_payload_materialization_spilled_rows: usize,
+    rhs_payload_materialization_spilled_bytes: usize,
     rhs_sort_spill_count: usize,
     rhs_sort_spilled_rows: usize,
     rhs_sort_spilled_bytes: usize,
@@ -619,6 +630,12 @@ struct BenchmarkRecord {
     patch_materialization_spill_count: usize,
     patch_materialization_spilled_rows: usize,
     patch_materialization_spilled_bytes: usize,
+    patch_mapping_sort_spill_count: usize,
+    patch_mapping_sort_spilled_rows: usize,
+    patch_mapping_sort_spilled_bytes: usize,
+    patch_mapping_materialization_spill_count: usize,
+    patch_mapping_materialization_spilled_rows: usize,
+    patch_mapping_materialization_spilled_bytes: usize,
     patch_sort_spill_count: usize,
     patch_sort_spilled_rows: usize,
     patch_sort_spilled_bytes: usize,
@@ -832,6 +849,12 @@ async fn run_worker(args: &Args) -> BenchResult<BenchmarkRecord> {
         spill_count: metrics.count("spill_count"),
         spilled_rows: metrics.count("spilled_rows"),
         spilled_bytes: metrics.count("spilled_bytes"),
+        rhs_payload_materialization_spill_count: metrics
+            .count("update_join_rhs_payload_materialization_spill_count"),
+        rhs_payload_materialization_spilled_rows: metrics
+            .count("update_join_rhs_payload_materialization_spilled_rows"),
+        rhs_payload_materialization_spilled_bytes: metrics
+            .count("update_join_rhs_payload_materialization_spilled_bytes"),
         rhs_sort_spill_count: metrics.count("update_join_rhs_sort_spill_count"),
         rhs_sort_spilled_rows: metrics.count("update_join_rhs_sort_spilled_rows"),
         rhs_sort_spilled_bytes: metrics.count("update_join_rhs_sort_spilled_bytes"),
@@ -850,6 +873,17 @@ async fn run_worker(args: &Args) -> BenchResult<BenchmarkRecord> {
             .count("update_join_patch_materialization_spilled_rows"),
         patch_materialization_spilled_bytes: metrics
             .count("update_join_patch_materialization_spilled_bytes"),
+        patch_mapping_sort_spill_count: metrics.count("update_join_patch_mapping_sort_spill_count"),
+        patch_mapping_sort_spilled_rows: metrics
+            .count("update_join_patch_mapping_sort_spilled_rows"),
+        patch_mapping_sort_spilled_bytes: metrics
+            .count("update_join_patch_mapping_sort_spilled_bytes"),
+        patch_mapping_materialization_spill_count: metrics
+            .count("update_join_patch_mapping_materialization_spill_count"),
+        patch_mapping_materialization_spilled_rows: metrics
+            .count("update_join_patch_mapping_materialization_spilled_rows"),
+        patch_mapping_materialization_spilled_bytes: metrics
+            .count("update_join_patch_mapping_materialization_spilled_bytes"),
         patch_sort_spill_count: metrics.count("update_join_patch_sort_spill_count"),
         patch_sort_spilled_rows: metrics.count("update_join_patch_sort_spilled_rows"),
         patch_sort_spilled_bytes: metrics.count("update_join_patch_sort_spilled_bytes"),
