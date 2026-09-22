@@ -12,7 +12,10 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion::{
     catalog::{TableProvider, streaming::StreamingTable},
-    execution::{SendableRecordBatchStream, TaskContext, runtime_env::RuntimeEnv},
+    execution::{
+        SendableRecordBatchStream, TaskContext, disk_manager::RefCountedTempFile,
+        runtime_env::RuntimeEnv,
+    },
     physical_plan::{
         SpillManager,
         metrics::{ExecutionPlanMetricsSet, SpillMetrics},
@@ -69,18 +72,84 @@ pub fn create_replay_spill(
     (sender, receiver)
 }
 
-/// Fully materializes a stream before replaying it.
+enum MaterializedStreamStorage {
+    Memory(Arc<[RecordBatch]>),
+    Spill {
+        manager: SpillManager,
+        file: RefCountedTempFile,
+    },
+}
+
+/// A fully materialized stream that can be replayed sequentially.
 ///
-/// Unlike [`spilling_table_provider`], this function does not allow replay to begin while the
-/// source is still running. It is intended as a pipeline barrier between operators whose
-/// non-spillable reservations cannot safely coexist in one memory pool. Up to `memory_limit`
-/// bytes are retained in memory; larger inputs use a DataFusion-managed spill file.
-pub async fn materialize_stream(
+/// The materialized batches remain in memory when they fit within the configured limit. Larger
+/// inputs are stored in a DataFusion-managed spill file, so temporary-disk accounting and cleanup
+/// follow the runtime's resource limits.
+pub struct MaterializedStream {
+    schema: SchemaRef,
+    storage: MaterializedStreamStorage,
+}
+
+impl MaterializedStream {
+    /// Opens a new stream over the materialized batches.
+    ///
+    /// Multiple streams may be opened, but callers should consume them sequentially to avoid
+    /// multiplying decoded-batch memory and disk IO.
+    pub fn read(&self) -> Result<SendableRecordBatchStream, DataFusionError> {
+        match &self.storage {
+            MaterializedStreamStorage::Memory(batches) => {
+                let batches = batches.to_vec();
+                Ok(Box::pin(RecordBatchStreamAdapter::new(
+                    self.schema.clone(),
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                )))
+            }
+            MaterializedStreamStorage::Spill { manager, file } => {
+                manager.read_spill_as_stream_unbuffered(file.clone(), None)
+            }
+        }
+    }
+}
+
+/// Fully materializes a stream into replayable memory or managed spill storage.
+///
+/// Up to `memory_limit` bytes are retained in memory. Larger inputs are written once to a
+/// DataFusion-managed spill file and can subsequently be replayed without evaluating the source
+/// again. The returned metrics describe the materialization write, not later reads.
+///
+/// # Examples
+///
+/// ```
+/// # use std::sync::Arc;
+/// # use arrow_array::RecordBatch;
+/// # use arrow_schema::Schema;
+/// # use datafusion::execution::{SendableRecordBatchStream, runtime_env::RuntimeEnvBuilder};
+/// # use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+/// # use datafusion_common::DataFusionError;
+/// # use lance_datafusion::spill::materialize_replayable_stream;
+/// # async fn example() -> Result<(), DataFusionError> {
+/// let schema = Arc::new(Schema::empty());
+/// let source: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+///     schema,
+///     futures::stream::empty::<Result<RecordBatch, DataFusionError>>(),
+/// ));
+/// let runtime = RuntimeEnvBuilder::new().build_arc()?;
+/// let (materialized, _metrics) =
+///     materialize_replayable_stream(source, runtime, 1024, "example").await?;
+///
+/// let first_read = materialized.read()?;
+/// drop(first_read);
+/// let second_read = materialized.read()?;
+/// drop(second_read);
+/// # Ok(())
+/// # }
+/// ```
+pub async fn materialize_replayable_stream(
     mut source: SendableRecordBatchStream,
     runtime: Arc<RuntimeEnv>,
     memory_limit: usize,
     request_description: &str,
-) -> Result<(SendableRecordBatchStream, ExecutionPlanMetricsSet), DataFusionError> {
+) -> Result<(MaterializedStream, ExecutionPlanMetricsSet), DataFusionError> {
     let schema = source.schema();
     let metrics = ExecutionPlanMetricsSet::new();
     let spill_metrics = SpillMetrics::new(&metrics, 0);
@@ -108,21 +177,35 @@ pub async fn materialize_stream(
         }
     }
 
-    let stream = if is_spilled {
-        if let Some(file) = spill_file.finish()? {
-            spill_manager.read_spill_as_stream_unbuffered(file, None)?
-        } else {
-            Box::pin(RecordBatchStreamAdapter::new(
-                schema.clone(),
-                futures::stream::empty(),
-            ))
+    let storage = if is_spilled {
+        match spill_file.finish()? {
+            Some(file) => MaterializedStreamStorage::Spill {
+                manager: spill_manager,
+                file,
+            },
+            None => MaterializedStreamStorage::Memory(Arc::new([])),
         }
     } else {
-        Box::pin(RecordBatchStreamAdapter::new(
-            schema.clone(),
-            futures::stream::iter(buffered_batches.into_iter().map(Ok)),
-        ))
+        MaterializedStreamStorage::Memory(buffered_batches.into())
     };
+    Ok((MaterializedStream { schema, storage }, metrics))
+}
+
+/// Fully materializes a stream before replaying it.
+///
+/// Unlike [`spilling_table_provider`], this function does not allow replay to begin while the
+/// source is still running. It is intended as a pipeline barrier between operators whose
+/// non-spillable reservations cannot safely coexist in one memory pool. Up to `memory_limit`
+/// bytes are retained in memory; larger inputs use a DataFusion-managed spill file.
+pub async fn materialize_stream(
+    source: SendableRecordBatchStream,
+    runtime: Arc<RuntimeEnv>,
+    memory_limit: usize,
+    request_description: &str,
+) -> Result<(SendableRecordBatchStream, ExecutionPlanMetricsSet), DataFusionError> {
+    let (materialized, metrics) =
+        materialize_replayable_stream(source, runtime, memory_limit, request_description).await?;
+    let stream = materialized.read()?;
     Ok((stream, metrics))
 }
 
@@ -817,6 +900,68 @@ mod tests {
         );
         assert_eq!(metrics.clone_inner().output_rows(), None);
         assert_eq!(stream.try_collect::<Vec<_>>().await.unwrap(), vec![batch]);
+    }
+
+    #[tokio::test]
+    async fn test_materialize_replayable_stream_reads_spill_twice() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batches = vec![
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap(),
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![Arc::new(Int32Array::from(vec![4, 5, 6]))],
+            )
+            .unwrap(),
+        ];
+        let source = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::iter(batches.clone().into_iter().map(Ok)),
+        ));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_disk_manager_builder(DiskManagerBuilder::default())
+            .build_arc()
+            .unwrap();
+
+        let (materialized, metrics) =
+            materialize_replayable_stream(source, runtime.clone(), 0, "test replay")
+                .await
+                .unwrap();
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            1
+        );
+        assert_eq!(metrics.clone_inner().spill_count(), Some(1));
+        assert_eq!(
+            materialized
+                .read()
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            batches
+        );
+        assert_eq!(
+            materialized
+                .read()
+                .unwrap()
+                .try_collect::<Vec<_>>()
+                .await
+                .unwrap(),
+            batches
+        );
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            1
+        );
+        drop(materialized);
+        assert_eq!(
+            runtime.disk_manager.spilling_progress().active_files_count,
+            0
+        );
     }
 
     #[tokio::test]
