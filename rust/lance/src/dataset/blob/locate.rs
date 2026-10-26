@@ -295,6 +295,37 @@ impl BlobV2ReadContext {
         }
     }
 
+    pub(super) async fn capture_reference(
+        &mut self,
+        columns: &BlobV2DescriptorColumns<'_>,
+        idx: usize,
+        row_addr: u64,
+        context: &crate::blob::reference::BlobSourceContext,
+    ) -> Result<Option<crate::blob::reference::BlobRef>> {
+        if columns.is_null_blob(idx) {
+            return Ok(None);
+        }
+        let kind = BlobKind::try_from(columns.kinds.value(idx))?;
+        if kind == BlobKind::External && columns.blob_ids.value(idx) == 0 {
+            // The URI is already absolute. Opening a store is unnecessary for
+            // transport and can perform network I/O, such as S3 region discovery.
+            let size = columns.sizes.value(idx);
+            return context
+                .reference(
+                    columns.blob_uris.value(idx).to_string(),
+                    columns.positions.value(idx),
+                    (size > 0).then_some(size),
+                    kind,
+                    None,
+                )
+                .map(Some);
+        }
+        self.resolve(columns, idx, row_addr)
+            .await?
+            .map(|resolved| resolved.into_reference(&self.dataset, context))
+            .transpose()
+    }
+
     pub(super) async fn resolve(
         &mut self,
         columns: &BlobV2DescriptorColumns<'_>,
