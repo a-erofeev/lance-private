@@ -88,6 +88,7 @@ pub mod retention;
 pub mod rowids;
 pub mod scanner;
 mod schema_evolution;
+pub mod snapshot;
 pub mod sql;
 pub mod statistics;
 mod take;

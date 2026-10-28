@@ -27,7 +27,6 @@ use bytes::{Buf, Bytes};
 use lance_arrow::{ARROW_EXT_META_KEY, ARROW_EXT_NAME_KEY};
 use lance_core::datatypes::BlobKind;
 use lance_core::{Error, Result};
-use lance_io::object_store::uri_to_url;
 use lance_table::{
     format::{Manifest, pb as table_pb},
     io::manifest::read_manifest_bytes,
@@ -48,7 +47,10 @@ pub use crate::dataset::blob::{
     BlobReadRange, BlobRefBinding, BlobRefDemand, BlobRefReadStream, BlobRefReader, BlobRefRequest,
     ReadBlobRef,
 };
-pub use crate::dataset::retention::BlobSnapshotRetention;
+mod retention;
+use crate::dataset::snapshot::{SnapshotIdentity, pb as snapshot_pb};
+pub(crate) use crate::dataset::snapshot::{canonical_uri, matches_loaded_manifest};
+pub use retention::BlobSnapshotRetention;
 
 pub(crate) mod pb {
     include!(concat!(env!("OUT_DIR"), "/lance.blob.reference.rs"));
@@ -208,6 +210,22 @@ impl BlobSourceContext {
     /// Original protobuf manifest image, including the source's registered bases.
     pub fn serialized_manifest(&self) -> &[u8] {
         &self.proto.manifest
+    }
+
+    /// Extract the general snapshot identity, independent of blob capabilities
+    /// and the authenticated worker routing key. Use it with
+    /// [`SnapshotRetention`](crate::dataset::retention::SnapshotRetention).
+    pub fn snapshot_identity(&self) -> Result<SnapshotIdentity> {
+        SnapshotIdentity::from_proto(snapshot_pb::SnapshotIdentity {
+            protocol_version: 1,
+            table_identity: self.proto.table_identity.clone(),
+            table_uri: self.proto.table_uri.clone(),
+            branch: self.proto.branch.clone(),
+            version: self.proto.version,
+            manifest_path: self.proto.manifest_path.clone(),
+            manifest: self.proto.manifest.clone(),
+            manifest_identity: self.proto.manifest_identity.clone(),
+        })
     }
 
     pub(crate) fn validate_dataset(&self, dataset: &Dataset) -> Result<()> {
@@ -793,21 +811,6 @@ impl BlobRefBatch {
     }
 }
 
-/// Compare a decoded manifest with a loaded snapshot, ignoring hydrated dictionary values.
-fn matches_loaded_manifest(observed: &Manifest, loaded: &Manifest) -> bool {
-    // Writes and session caches populate dictionary values that are not part of
-    // the manifest schema's persisted dictionary metadata.
-    let mut expected = loaded.clone();
-    let mut fields = expected.schema.fields.iter_mut().collect::<Vec<_>>();
-    while let Some(field) = fields.pop() {
-        if let Some(dictionary) = &mut field.dictionary {
-            dictionary.values = None;
-        }
-        fields.extend(&mut field.children);
-    }
-    observed == &expected
-}
-
 fn check_version(version: u32, component: &str) -> Result<()> {
     if version != VERSION {
         return Err(Error::invalid_input(format!(
@@ -815,22 +818,6 @@ fn check_version(version: u32, component: &str) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-pub(crate) fn canonical_uri(uri: &str) -> Result<String> {
-    if url::Url::parse(uri).is_err() && !std::path::Path::new(uri).is_absolute() {
-        return Err(Error::invalid_input(format!(
-            "Blob reference URI must be absolute: {uri}"
-        )));
-    }
-    let url = uri_to_url(uri)?;
-    let has_username = !url.username().is_empty() && !matches!(url.scheme(), "az" | "abfss");
-    if url.fragment().is_some() || has_username || url.password().is_some() {
-        return Err(Error::invalid_input(
-            "Blob reference URI must not contain credentials or a fragment",
-        ));
-    }
-    Ok(url.to_string())
 }
 
 #[cfg(test)]
@@ -2519,6 +2506,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retention.tag_name(), duplicate.tag_name());
+        let generic = crate::SnapshotRetention::acquire(
+            &dataset,
+            source.snapshot_identity().unwrap(),
+            "query-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(retention.tag_name(), generic.tag_name());
+        let other_binding =
+            BlobSourceContext::from_dataset(&dataset, "catalog/retention", "different-workers")
+                .await
+                .unwrap();
+        assert_ne!(source.source_id(), other_binding.source_id());
+        assert_eq!(
+            source.snapshot_identity().unwrap(),
+            other_binding
+                .with_external_immutability_assumption()
+                .snapshot_identity()
+                .unwrap()
+        );
         assert_eq!(
             retention.encode(),
             BlobSnapshotRetention::decode(&retention.encode())
