@@ -1,0 +1,74 @@
+Unified index visibility. Questions and answers
+
+1. Does “unified” mean shared policy while preserving existing behavior, or identical behavior across query families? In particular,
+should fast_search replay updated rows everywhere? My initial assumption is to preserve its current per-path contracts and document
+them explicitly.
+
+1. "Unified" = shared policy, not identical behavior. The paths already disagree deliberately, and tests lock that in. Scalar filtering replays updated rows even under fast_search (scanner.rs:4330-4342, union built at :4385-4414; test_btree_overlay_masked_under_fast_search asserts the new value is found). ANN/FTS/MinHash block regardless of fast_search but only replay when it is off (:7040-7051, :6088, :4783). fast_search is documented as index-only / weak consistency (:2660-2672). Making it replay everywhere would silently change recall contracts on three families. Recommend: one policy object with an explicit replay flag per consumer, and document each path's answer.
+
+
+2. Must this task enable overlays with tagged fragment-reuse histories? Those combinations are currently gated. My recommendation is
+to keep the gates for the first phase unless enabling them is an explicit acceptance criterion.
+
+2. Keep the tagged-FRI gates. Operation::DataOverlay and Operation::Clone are refused by name on a tagged table (lance-table/src/system_index/frag_reuse/gate.rs:322-328), with overlay_and_clone_stay_refused_on_a_tagged_table covering every tagged state (:765-793). Enabling them needs overlay offsets translated through rewrite transitions — real design work. Also note both related feature flags are off in release: FLAG_UNSTABLE_DATA_OVERLAY_FILES is debug-only without an env override, and FLAG_INDEPENDENT_COVERING_FIELDS is reserved and masked out (feature_flags.rs:306-345).
+
+
+
+3. Does visibility include MemWAL memtables and SSTables? If yes, the scope includes sequence-based visibility, latest primary-key
+versions, tombstones, and base-table catch-up ownership. I would make that a separate integration phase rather than equating it with
+persistent-fragment masks.
+
+3. MemWAL is a separate phase. Different visibility stack: per-shard manifests, gap-free batch sequence, indexed_count vs. reader-visible cursor (mem_wal/index.rs:165-176), PK newest-version dedup, _tombstone, and its own memtable/SSTable indexes. The base-table arm goes through the normal Dataset scanner, so overlay masking already applies there; the missing work is composing sequence visibility with index coverage.
+
+
+
+4. What is the required FTS scoring contract after changes? Is correct visible membership with current documented scoring behavior
+sufficient, or must scores and ranking match a freshly rebuilt index across all paths? The latter is broader than invalidation centralization.
+
+4. Membership + current documented scoring is achievable; score parity on all paths is not currently a contract. combined_fields subtracts stale rows' pre-overlay postings from corpus statistics and asserts exact score preservation (io/exec/fts.rs:4585-4589, folded at :4780-4860; tests preserves_every_score:2120, preserves_prefilter_corpus:1995, agrees_with_match:1840). Single-column MatchQuery has no equivalent subtraction — its overlay tests assert membership only. The stricter requirement would need per-field statistics reconciliation across match, phrase, MultiMatch, compound, and the distributed base_scorer path.
+
+
+
+5. Which index families and consumers are acceptance targets? I would cover current built-in scalar filtering, ANN, FTS, and indexed
+merge-insert. MinHash is another ranked scalar consumer with overlay replay today and should at least receive regression coverage.
+Covering indices and external plugins must retain their existing capability and ownership rules.
+
+5. Acceptance targets: built-in scalar filtering, ANN (single + multivector + the batch-node gate at :7185-7210), FTS (match, phrase, MultiMatch, compound, combined_fields), MinHash, and indexed merge-insert (write/merge_insert.rs:1464-1551). Two easy-to-miss consumers: ZoneMap statistics (already conservative, dataset/statistics.rs:178-191) and count pushdown (see gap A). Plugins/external indices keep their existing ownership and capability rules — a plugin used as a scalar leaf is covered by the generic block mask.
+
+
+
+6. Is conservative whole-fragment invalidation after materialization acceptable? It preserves correctness with current metadata.
+Requiring row-level preservation through every maintenance operation could need a wider provenance/freshness design.
+
+6. Conservative whole-fragment invalidation is fine and is already the maintenance pattern. Overlay materialization drops the group's fragments from coverage (index_maintenance.rs:496-538), in-place column rewrites drop affected fragments (:411-432), remap removes fragments with newer indexed overlays (optimize/remapping.rs:317-336, :989-1005). The spec explicitly allows either granularity (docs/src/format/index/index.md:299-300). Row-level preservation through every maintenance op would need provenance/freshness metadata that doesn't exist.
+
+
+
+7. Is there a known failure sequence or issue behind the task? Most described behavior already has implementation and tests. A
+reproducer would show whether success primarily means fixing a remaining gap, reducing duplicated logic, enabling a currently
+unsupported operation, or all three.
+
+7. History says consolidation plus seam-closing: ac705611d (deferred overlay compaction), b62e0249c (merged coverage through compaction), af961e797 (overlay-stale rows in indexed merge-insert), 72467abb6 (FTS re-eval), 253465798 (overlays across rebased deletes). Two concrete gaps remain:
+
+Gap A — COUNT(*) pushdown ignores the overlay block (confirmed, smallest fix). new_filtered_read computes and attaches the block (scanner.rs:4330-4342); CountPushdown then extracts index_input as prefilter_input and replaces the FilteredReadExec (count_pushdown.rs:220, :260-311), so without_rows (filtered_read.rs:2760-2773) never runs. The safety gate checks with_deleted_rows, physical row selections, refine filters, and inexact leaves — but never options.overlay_block (count_pushdown.rs:150-247). Reproducer: BTree on age, overlay 10 → 999; count_rows("age = 10") returns 1 (should be 0), age = 999 returns 0 (should be 1). Minimal fix: refuse pushdown when overlay_block.is_some(), or fold the block into CountFromMaskExec's mask. The former is more conservative and matches existing style.
+Gap B — distributed FilteredReadExec loses the policy. The wire format has neither overlay_block nor only_indexed_fragments (rust/lance/protos/filtered_read.proto:51-87, filtered_read_proto.rs:120-240). A masked/fast-search plan shipped planner→executor would leak stale hits or read unindexed fragments. This only counts if distributed scans are in scope; otherwise state it explicitly as out of scope.
+Two secondary notes, not blockers: the remap paths use bare fields.contains(field_id) while the query paths use field_affects_index (ancestry-aware). Equivalent under the legacy covering contract, divergent once bit 13 is enabled. And index merge takes min(inputs.dataset_version) (index/optimize.rs:1126-1129) — conservative and correct, but currently untested
+
+
+
+The mechanism already works; it is duplicated. Build one snapshot-scoped visibility policy and make scalar / ANN / FTS / MinHash / merge-insert derive from it. Preserve every path's current behavior — in particular, do not make fast_search replay. Then fix one real bug (COUNT(*) ignores the overlay block) and lock everything with an acceptance matrix.
+Action items, in order
+#	Do
+0	Write the reproducer: BTree on age, overlay 10 → 999, assert count_rows("age = 10") == 0 and count_rows("age = 999") == 1
+1	Add one policy value in lance-table (next to overlay/staleness.rs) exposing served_fragments(segment), stale_rows(segment), stale_frags(segment), and dependency fields = fields ∪ covering_fields with ancestry
+2	Migrate the six consumers one commit at a time: partition_frags_by_coverage, overlay_stale_index_rows, overlay_stale_vector_rows, fts_overlay_plan, MinHash inline, overlay_stale_rows_for_keys. Add an explicit replay flag per consumer
+3	Fix count_pushdown.rs: refuse the rewrite when options.overlay_block.is_some() (or fold the block into the mask)
+4	Add the matrix: {column update, row-move update, delete, compaction, index optimize, remap, merge-insert} × {BTree, ANN, FTS match/phrase/combined, MinHash}; oracle = freshly rebuilt index on the same snapshot; assert zero stale / missing / duplicate
+5	Document per-consumer fast_search semantics in docs/src/format/index/index.md
+Definition of done
+- One function answers "is this segment's answer still authoritative for this row"; no consumer re-derives it.
+- COUNT(*) matches the equivalent scan under overlays.
+- The matrix passes, with scores asserted only where they already hold (combined_fields).
+- No change to fast_search semantics on any family.
+Explicitly out of scope (phase 1)
+Tagged-FRI + overlays (keep the gates), MemWAL visibility, all-path FTS score parity, distributed FilteredReadExec wire format (unless distributed scans are an acceptance criterion).
